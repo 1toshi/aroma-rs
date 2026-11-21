@@ -1,6 +1,3 @@
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::Instant;

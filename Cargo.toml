@@ -16,7 +16,6 @@ path = "src/main.rs"
 [dependencies]
 hashbrown = "=0.15.5"
 memchr = "=2.7.6"
-mimalloc = { version = "=0.1.50", default-features = false }
 rayon = "=1.11.0"
 rustc-hash = "=2.1.1"
 serde = { version = "=1.0.228", features = ["derive"] }
