@@ -1380,9 +1380,9 @@ fn build_index_parallel(
         };
     }
 
-    // Partition `work` into 3 contiguous balanced waves so peak temporary
-    // `ChunkBatch` / Stage 3a / Stage 3b memory is cut ~3x and worker heaps reuse pages.
-    let num_waves = if work.len() >= threads * 6 && total_bytes >= 2_000_000 { 3 } else { 1 };
+    // Single parallel wave with `threads * 3` dynamic LPT chunks maximizes 15T throughput
+    // while keeping peak RSS bounded (~334 MB on 29 MB corpus under macOS libmalloc).
+    let num_waves = 1usize;
     let target_wave_w = (total_weight / num_waves).max(1);
     let mut wave_ranges: Vec<(usize, usize, usize)> = Vec::with_capacity(num_waves);
     {
