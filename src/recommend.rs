@@ -324,7 +324,6 @@ fn render_recommendation(
     query_like_tokens: &[usize],
 ) -> (Vec<RecommendedLine>, String) {
     let mut roles: FxHashMap<u32, LineRole> = FxHashMap::default();
-    let (starts, ends) = lidx.location_token_lines(loc);
 
     // Build fast membership bitset/sorted check for `query_like_tokens` (both `kept` and `query_like_tokens` are sorted ascending!)
     let mut ql_i = 0usize;
@@ -334,7 +333,8 @@ fn render_recommendation(
         }
         let is_ql = ql_i < query_like_tokens.len() && query_like_tokens[ql_i] == tok;
         let new_role = if is_ql { LineRole::Query } else { LineRole::Added };
-        for ln in starts[tok]..=ends[tok] {
+        let (s_ln, e_ln) = lidx.tok_line_span(loc, tok);
+        for ln in s_ln..=e_ln {
             match roles.get(&ln) {
                 Some(LineRole::Added) => {}
                 _ => {

@@ -13,8 +13,7 @@ use std::cell::RefCell;
 use rayon::prelude::*;
 
 use crate::index::{
-    AromaIndex, IndexedMethod, LanguageIndex, MethodLocation, Query, COUNT_OVERFLOW, COUNT_SHIFT,
-    MID_MASK,
+    AromaIndex, LanguageIndex, MethodLocation, Query, COUNT_OVERFLOW, COUNT_SHIFT, MID_MASK,
 };
 use crate::prune::{
     prune_fast, prune_with_fast_map, FastQueryMap, PruneScratch, PruneTarget, Pruned,
@@ -81,17 +80,18 @@ thread_local! {
 
 #[inline]
 fn is_location_usable(
-    index: &AromaIndex,
     lidx: &LanguageIndex,
     loc: &MethodLocation,
-    origin: Option<&MethodRef>,
+    origin: Option<(Option<u32>, &MethodRef)>,
     exclude: Option<&(dyn Fn(&MethodRef) -> bool + Sync)>,
+    index: &AromaIndex,
 ) -> bool {
-    if let Some(orig) = origin {
-        let loc_path = &index.sources[loc.file_id as usize].path;
-        if loc_path == &orig.path && loc.start_line <= orig.end_line && loc.end_line >= orig.start_line {
-            return false;
-        }
+    if let Some((orig_fid, orig)) = origin
+        && orig_fid == Some(loc.file_id)
+        && loc.start_line <= orig.end_line
+        && loc.end_line >= orig.start_line
+    {
+        return false;
     }
     if let Some(ex) = exclude {
         let mref = index.make_ref(lidx, loc);
@@ -106,14 +106,28 @@ fn is_location_usable(
 fn first_usable_location<'a>(
     index: &AromaIndex,
     lidx: &'a LanguageIndex,
-    m: &'a IndexedMethod,
-    origin: Option<&MethodRef>,
+    mid: usize,
+    origin: Option<(Option<u32>, &MethodRef)>,
     exclude: Option<&(dyn Fn(&MethodRef) -> bool + Sync)>,
 ) -> Option<&'a MethodLocation> {
-    if is_location_usable(index, lidx, &m.primary, origin, exclude) {
+    if exclude.is_none() {
+        match origin {
+            None => return Some(&unsafe { lidx.methods.get_unchecked(mid) }.primary),
+            Some((None, _)) => return Some(&unsafe { lidx.methods.get_unchecked(mid) }.primary),
+            Some((Some(ofid), _)) => {
+                if unsafe { *lidx.canonical_file_id.get_unchecked(mid) } != ofid {
+                    return Some(&unsafe { lidx.methods.get_unchecked(mid) }.primary);
+                }
+            }
+        }
+    }
+    let m = unsafe { lidx.methods.get_unchecked(mid) };
+    if is_location_usable(lidx, &m.primary, origin, exclude, index) {
         return Some(&m.primary);
     }
-    m.copies.iter().find(|c| is_location_usable(index, lidx, c, origin, exclude))
+    m.copies
+        .iter()
+        .find(|c| is_location_usable(lidx, c, origin, exclude, index))
 }
 
 pub(crate) fn rank_scored<'a>(
@@ -129,7 +143,8 @@ pub(crate) fn rank_scored<'a>(
         return Vec::new();
     }
 
-    let origin = query.origin.as_ref();
+    let origin: Option<(Option<u32>, &MethodRef)> =
+        query.origin.as_ref().map(|o| (index.path_to_id.get(&o.path).copied(), o));
     let max_possible_ov = query.features.len();
     let use_packed_32 = query.size <= u16::MAX as usize && max_possible_ov <= u16::MAX as usize;
 
@@ -231,7 +246,7 @@ pub(crate) fn rank_scored<'a>(
                 break;
             }
             if let Some(loc) =
-                first_usable_location(index, lidx, &lidx.methods[mid as usize], origin, exclude)
+                first_usable_location(index, lidx, mid as usize, origin, exclude)
             {
                 out.push(ScoredCandidate { mid, loc, score: acc[mid as usize] & 0xFFFF });
             }
@@ -251,7 +266,7 @@ pub(crate) fn rank_scored<'a>(
                     break;
                 }
                 if let Some(loc) =
-                    first_usable_location(index, lidx, &lidx.methods[mid as usize], origin, exclude)
+                    first_usable_location(index, lidx, mid as usize, origin, exclude)
                 {
                     out.push(ScoredCandidate { mid, loc, score });
                 }
@@ -288,7 +303,7 @@ pub(crate) fn rank_scored<'a>(
                 break;
             }
             if let Some(loc) =
-                first_usable_location(index, lidx, &lidx.methods[mid as usize], origin, exclude)
+                first_usable_location(index, lidx, mid as usize, origin, exclude)
             {
                 out.push(ScoredCandidate { mid, loc, score });
             }
@@ -301,16 +316,65 @@ pub(crate) fn rank_scored<'a>(
 }
 
 fn matched_lines_of(lidx: &LanguageIndex, loc: &MethodLocation, tokens: &[usize]) -> Vec<u32> {
-    let (starts, ends) = lidx.location_token_lines(loc);
-    let mut lines: Vec<u32> = Vec::with_capacity(tokens.len());
-    for &t in tokens {
-        for ln in starts[t]..=ends[t] {
-            lines.push(ln);
+    let base = loc.start_line;
+    let span = loc.end_line.saturating_sub(base) + 1;
+    if span <= 512 {
+        let mut bits = [0u64; 8];
+        let mut overflow: Option<Vec<u32>> = None;
+        let mut count = 0usize;
+        for &t in tokens {
+            let (a, b) = lidx.tok_line_span(loc, t);
+            for ln in a..=b {
+                let rel = ln.wrapping_sub(base);
+                if rel < 512 {
+                    let w = (rel >> 6) as usize;
+                    let mask = 1u64 << (rel & 63);
+                    if (bits[w] & mask) == 0 {
+                        bits[w] |= mask;
+                        count += 1;
+                    }
+                } else {
+                    overflow.get_or_insert_with(Vec::new).push(ln);
+                }
+            }
         }
+        if let Some(mut extra) = overflow {
+            for (w, &word) in bits.iter().enumerate() {
+                let mut x = word;
+                let wbase = base + (w as u32) * 64;
+                while x != 0 {
+                    let tz = x.trailing_zeros();
+                    extra.push(wbase + tz);
+                    x &= x - 1;
+                }
+            }
+            extra.sort_unstable();
+            extra.dedup();
+            return extra;
+        }
+        let mut out = Vec::with_capacity(count);
+        for (w, &word) in bits.iter().enumerate() {
+            let mut x = word;
+            let wbase = base + (w as u32) * 64;
+            while x != 0 {
+                let tz = x.trailing_zeros();
+                out.push(wbase + tz);
+                x &= x - 1;
+            }
+        }
+        out
+    } else {
+        let mut lines: Vec<u32> = Vec::with_capacity(tokens.len());
+        for &t in tokens {
+            let (a, b) = lidx.tok_line_span(loc, t);
+            for ln in a..=b {
+                lines.push(ln);
+            }
+        }
+        lines.sort_unstable();
+        lines.dedup();
+        lines
     }
-    lines.sort_unstable();
-    lines.dedup();
-    lines
 }
 
 pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) -> Vec<SearchResult> {

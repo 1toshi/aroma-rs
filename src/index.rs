@@ -121,14 +121,18 @@ pub(crate) struct IndexedMethod {
 pub(crate) struct LanguageIndex {
     pub lang_id: String,
     pub methods: Vec<IndexedMethod>,
+    /// Flat file_id of each canonical method (`primary.file_id`), enabling L1/L2 origin
+    /// filtering in Phase I without dereferencing `IndexedMethod`.
+    pub canonical_file_id: Vec<u32>,
     /// Flat CSR feature IDs for all canonical methods of this language
     pub all_features: Vec<u32>,
     /// Flat CSR per-token feature offsets (each method has `tok_count + 1` entries, relative to `feat_start`)
     pub all_offsets: Vec<u32>,
     /// Flat token start lines for all canonical + duplicate locations
     pub all_token_lines: Vec<u32>,
-    /// Flat token end lines for all canonical + duplicate locations
-    pub all_token_end_lines: Vec<u32>,
+    /// 1-byte `end_line - line` delta per token (`255` means consult `token_end_overflow`)
+    pub all_token_end_delta: Vec<u8>,
+    pub token_end_overflow: FxHashMap<u32, u32>,
     /// Flat precomputed structural spans for zero-reparse rendering
     pub all_struct_spans: Vec<StructSpan>,
     /// Inverted index indexed by global `feature_id` (`0..=num_features`)
@@ -144,10 +148,12 @@ impl LanguageIndex {
         Self {
             lang_id,
             methods: Vec::new(),
+            canonical_file_id: Vec::new(),
             all_features: Vec::new(),
             all_offsets: Vec::new(),
             all_token_lines: Vec::new(),
-            all_token_end_lines: Vec::new(),
+            all_token_end_delta: Vec::new(),
+            token_end_overflow: FxHashMap::default(),
             all_struct_spans: Vec::new(),
             posting_offsets: Vec::new(),
             postings: Vec::new(),
@@ -170,11 +176,17 @@ impl LanguageIndex {
         &self.all_offsets[s..s + m.primary.tok_count as usize + 1]
     }
 
-    #[inline]
-    pub fn location_token_lines(&self, loc: &MethodLocation) -> (&[u32], &[u32]) {
-        let s = loc.tok_line_start as usize;
-        let e = s + loc.tok_count as usize;
-        (&self.all_token_lines[s..e], &self.all_token_end_lines[s..e])
+    #[inline(always)]
+    pub fn tok_line_span(&self, loc: &MethodLocation, tok: usize) -> (u32, u32) {
+        let at = loc.tok_line_start as usize + tok;
+        let line = unsafe { *self.all_token_lines.get_unchecked(at) };
+        let d = unsafe { *self.all_token_end_delta.get_unchecked(at) };
+        let end = if d < 255 {
+            line + d as u32
+        } else {
+            line + self.token_end_overflow[&(at as u32)]
+        };
+        (line, end)
     }
 
     #[inline]
@@ -195,6 +207,7 @@ pub struct AromaIndex {
     pub(crate) stats: IndexStats,
     pub(crate) feature_table: ShardedFeatureTable,
     pub(crate) sources: Vec<SourceEntry>,
+    pub(crate) path_to_id: FxHashMap<String, u32>,
     /// Reusable worker pool when built with `threads > 1` (`None` for `--threads 1`).
     pub(crate) pool: Option<rayon::ThreadPool>,
 }
@@ -301,7 +314,8 @@ struct ParseScratch {
     hashes: Vec<u64>,
     offsets: Vec<u32>,
     tok_lines: Vec<u32>,
-    tok_end_lines: Vec<u32>,
+    tok_end_delta: Vec<u8>,
+    end_overflow: Vec<(u32, u32)>,
 }
 
 thread_local! {
@@ -452,7 +466,7 @@ fn build_index_single(
                 lang_indices[li].all_features.reserve(b / 3);
                 lang_indices[li].all_offsets.reserve(b / 10);
                 lang_indices[li].all_token_lines.reserve(b / 10);
-                lang_indices[li].all_token_end_lines.reserve(b / 10);
+                lang_indices[li].all_token_end_delta.reserve(b / 10);
                 lang_indices[li].all_struct_spans.reserve(b / 20);
             }
         }
@@ -494,16 +508,21 @@ fn build_index_single(
             if let Some(&earlier_mid) = seen.get(&key) {
                 let tok_line_start = lidx.all_token_lines.len() as u32;
                 let span_start = lidx.all_struct_spans.len() as u32;
+                scratch.end_overflow.clear();
                 let tok_count = extract_location_and_spans(
                     &scratch.body,
                     m.body_root,
                     &mut lidx.all_token_lines,
-                    &mut lidx.all_token_end_lines,
+                    &mut lidx.all_token_end_delta,
+                    &mut scratch.end_overflow,
                     &mut lidx.all_struct_spans,
                     &mut scratch.feat,
                 );
                 if tok_count == 0 {
                     continue;
+                }
+                for &(rel_tok, d) in &scratch.end_overflow {
+                    lidx.token_end_overflow.insert(tok_line_start + rel_tok, d);
                 }
                 let span_end = lidx.all_struct_spans.len() as u32;
                 let file_id = *file_id_opt
@@ -524,6 +543,7 @@ fn build_index_single(
 
             scratch.hashes.clear();
             scratch.offsets.clear();
+            scratch.end_overflow.clear();
             let tok_line_start = lidx.all_token_lines.len() as u32;
             let span_start = lidx.all_struct_spans.len() as u32;
             let tok_count = featurize_body_hashed(
@@ -536,12 +556,16 @@ fn build_index_single(
                 &mut scratch.hashes,
                 &mut scratch.offsets,
                 &mut lidx.all_token_lines,
-                &mut lidx.all_token_end_lines,
+                &mut lidx.all_token_end_delta,
+                &mut scratch.end_overflow,
                 Some(&mut lidx.all_struct_spans),
             );
             if tok_count == 0 {
                 lidx.all_struct_spans.truncate(span_start as usize);
                 continue;
+            }
+            for &(rel_tok, d) in &scratch.end_overflow {
+                lidx.token_end_overflow.insert(tok_line_start + rel_tok, d);
             }
             let span_end = lidx.all_struct_spans.len() as u32;
             let file_id = *file_id_opt
@@ -557,6 +581,7 @@ fn build_index_single(
             }
 
             let mid = lidx.methods.len() as u32;
+            lidx.canonical_file_id.push(file_id);
             lidx.methods.push(IndexedMethod {
                 primary: MethodLocation {
                     file_id,
@@ -579,7 +604,6 @@ fn build_index_single(
 
     drop(scratch);
     drop(seen);
-    drop(path_to_id);
     lezer::shrink_tl_workspace();
     lang_py::shrink_tl_tree();
     lang_ts::shrink_tl_tree();
@@ -599,6 +623,7 @@ fn build_index_single(
         stats,
         feature_table,
         sources,
+        path_to_id,
         pool: None,
     }
 }
@@ -623,6 +648,7 @@ struct ChunkMethod {
     tok_count: u32,
     feat_len: u32,
     span_len: u32,
+    overflow_len: u32,
 }
 
 struct ChunkBatch {
@@ -631,7 +657,8 @@ struct ChunkBatch {
     local_fids: Vec<u32>,
     offsets: Vec<u32>,
     tok_lines: Vec<u32>,
-    tok_end_lines: Vec<u32>,
+    tok_end_delta: Vec<u8>,
+    end_overflow: Vec<(u32, u32)>,
     spans: Vec<StructSpan>,
 }
 
@@ -921,6 +948,7 @@ fn build_index_parallel(
             stats,
             feature_table: ShardedFeatureTable::new(),
             sources: Vec::new(),
+            path_to_id: FxHashMap::default(),
             pool: Some(pool),
         };
     }
@@ -951,7 +979,7 @@ fn build_index_parallel(
 
     let num_langs = languages.len();
 
-    let (lang_indices, global_order, feature_table, sources) = pool.install(|| {
+    let (lang_indices, global_order, feature_table, sources, path_to_id) = pool.install(|| {
         // Stage 1: Parallel chunk parse + simplify + intra-chunk dedup + chunk-local interning
         let chunks: Vec<ChunkBatch> = chunk_ranges
             .par_iter()
@@ -964,7 +992,8 @@ fn build_index_parallel(
                     local_fids: Vec::new(),
                     offsets: Vec::new(),
                     tok_lines: Vec::new(),
-                    tok_end_lines: Vec::new(),
+                    tok_end_delta: Vec::new(),
+                    end_overflow: Vec::new(),
                     spans: Vec::new(),
                 };
 
@@ -979,18 +1008,21 @@ fn build_index_parallel(
                         let digest = sc.body.digest(base, m.body_root);
                         let key = (lang_idx, digest);
                         let s_start = batch.spans.len();
+                        let ov_start = batch.end_overflow.len();
 
                         if local_seen.contains(&key) {
                             let tok_count = extract_location_and_spans(
                                 &sc.body,
                                 m.body_root,
                                 &mut batch.tok_lines,
-                                &mut batch.tok_end_lines,
+                                &mut batch.tok_end_delta,
+                                &mut batch.end_overflow,
                                 &mut batch.spans,
                                 &mut sc.feat,
                             );
                             if tok_count == 0 {
                                 batch.spans.truncate(s_start);
+                                batch.end_overflow.truncate(ov_start);
                                 continue;
                             }
                             batch.methods.push(ChunkMethod {
@@ -1003,6 +1035,7 @@ fn build_index_parallel(
                                 tok_count: tok_count as u32,
                                 feat_len: 0,
                                 span_len: (batch.spans.len() - s_start) as u32,
+                                overflow_len: (batch.end_overflow.len() - ov_start) as u32,
                             });
                             continue;
                         }
@@ -1019,12 +1052,14 @@ fn build_index_parallel(
                             &mut sc.hashes,
                             &mut batch.offsets,
                             &mut batch.tok_lines,
-                            &mut batch.tok_end_lines,
+                            &mut batch.tok_end_delta,
+                            &mut batch.end_overflow,
                             Some(&mut batch.spans),
                         );
                         if tok_count == 0 {
                             batch.offsets.truncate(o_start);
                             batch.spans.truncate(s_start);
+                            batch.end_overflow.truncate(ov_start);
                             continue;
                         }
                         local_seen.insert(key);
@@ -1050,6 +1085,7 @@ fn build_index_parallel(
                             tok_count: tok_count as u32,
                             feat_len: sc.hashes.len() as u32,
                             span_len: (batch.spans.len() - s_start) as u32,
+                            overflow_len: (batch.end_overflow.len() - ov_start) as u32,
                         });
                     }
                 }
@@ -1087,10 +1123,11 @@ fn build_index_parallel(
             }
             for li in 0..num_langs {
                 lang_indices[li].all_token_lines.reserve_exact(tok_totals[li]);
-                lang_indices[li].all_token_end_lines.reserve_exact(tok_totals[li]);
+                lang_indices[li].all_token_end_delta.reserve_exact(tok_totals[li]);
                 lang_indices[li].all_struct_spans.reserve_exact(span_totals[li]);
                 lang_indices[li].all_offsets.reserve(off_totals[li]);
                 lang_indices[li].methods.reserve(meth_totals[li]);
+                lang_indices[li].canonical_file_id.reserve(meth_totals[li]);
             }
         }
         let mut global_order: Vec<(u16, u32)> = Vec::new();
@@ -1112,6 +1149,7 @@ fn build_index_parallel(
             let mut o_cur = 0usize;
             let mut t_cur = 0usize;
             let mut s_cur = 0usize;
+            let mut ov_cur = 0usize;
 
             for m in batch.methods {
                 let file_id = if m.file_idx == last_file_idx {
@@ -1137,10 +1175,14 @@ fn build_index_parallel(
                 let lidx = &mut lang_indices[li];
                 let t_end = t_cur + m.tok_count as usize;
                 let s_end = s_cur + m.span_len as usize;
+                let ov_end = ov_cur + m.overflow_len as usize;
 
                 let tok_line_start = lidx.all_token_lines.len() as u32;
                 lidx.all_token_lines.extend_from_slice(&batch.tok_lines[t_cur..t_end]);
-                lidx.all_token_end_lines.extend_from_slice(&batch.tok_end_lines[t_cur..t_end]);
+                lidx.all_token_end_delta.extend_from_slice(&batch.tok_end_delta[t_cur..t_end]);
+                for &(rel_tok, d) in &batch.end_overflow[ov_cur..ov_end] {
+                    lidx.token_end_overflow.insert(tok_line_start + rel_tok, d);
+                }
                 let span_start = lidx.all_struct_spans.len() as u32;
                 lidx.all_struct_spans.extend_from_slice(&batch.spans[s_cur..s_end]);
                 let span_end = lidx.all_struct_spans.len() as u32;
@@ -1180,6 +1222,7 @@ fn build_index_parallel(
                     });
 
                     let mid = lidx.methods.len() as u32;
+                    lidx.canonical_file_id.push(file_id);
                     lidx.methods.push(IndexedMethod {
                         primary: loc,
                         copies: Vec::new(),
@@ -1195,13 +1238,13 @@ fn build_index_parallel(
 
                 t_cur = t_end;
                 s_cur = s_end;
+                ov_cur = ov_end;
             }
 
             all_chunk_hashes.push(batch.local_hashes);
             all_chunk_fids.push(batch.local_fids);
         }
         drop(seen);
-        drop(path_to_id);
 
         // Clone retained file sources in parallel!
         sources
@@ -1347,7 +1390,7 @@ fn build_index_parallel(
         stats.methods = global_order.len();
         stats.features = feature_count;
 
-        (lang_indices, global_order, feature_table, sources)
+        (lang_indices, global_order, feature_table, sources, path_to_id)
     });
 
     AromaIndex {
@@ -1357,6 +1400,7 @@ fn build_index_parallel(
         stats,
         feature_table,
         sources,
+        path_to_id,
         pool: Some(pool),
     }
 }
@@ -1419,7 +1463,8 @@ pub fn query_from_snippet(
         sc.hashes.clear();
         sc.offsets.clear();
         sc.tok_lines.clear();
-        sc.tok_end_lines.clear();
+        sc.tok_end_delta.clear();
+        sc.end_overflow.clear();
 
         let owned_dedent: String;
         let (root, base): (u32, &[u8]) = match lang.builtin_kind() {
@@ -1449,7 +1494,8 @@ pub fn query_from_snippet(
             &mut sc.hashes,
             &mut sc.offsets,
             &mut sc.tok_lines,
-            &mut sc.tok_end_lines,
+            &mut sc.tok_end_delta,
+            &mut sc.end_overflow,
             None,
         );
         if tok_count == 0 {
@@ -1481,7 +1527,8 @@ pub fn queries_from_lines(index: &AromaIndex, file: &SourceFile, lines: &[u32]) 
             sc.hashes.clear();
             sc.offsets.clear();
             sc.tok_lines.clear();
-            sc.tok_end_lines.clear();
+            sc.tok_end_delta.clear();
+            sc.end_overflow.clear();
             let mut covered: Vec<u32> = Vec::new();
 
             let mut pred = |line: u32, end_line: u32| -> bool {
@@ -1505,7 +1552,8 @@ pub fn queries_from_lines(index: &AromaIndex, file: &SourceFile, lines: &[u32]) 
                 &mut sc.hashes,
                 &mut sc.offsets,
                 &mut sc.tok_lines,
-                &mut sc.tok_end_lines,
+                &mut sc.tok_end_delta,
+                &mut sc.end_overflow,
                 None,
             );
             if tok_count > 0 {
