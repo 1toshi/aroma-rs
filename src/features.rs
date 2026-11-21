@@ -375,10 +375,9 @@ struct MemberLabel {
 pub(crate) struct FeatScratch {
     frames: Vec<FastFrame>,
     leaves: Vec<FastLeaf>,
-    counts: Vec<u32>,
-    extra: Vec<(u32, u64)>,
-    own_hashes: Vec<u64>,
-    own_lens: Vec<u8>,
+    prev_use_idx: Vec<u32>,
+    next_use_idx: Vec<u32>,
+    use_hashes: Vec<u64>,
     anc_lines: Vec<u32>,
     lu_slots: Vec<LastUseSlot>,
     lu_epoch: u32,
@@ -799,7 +798,9 @@ pub(crate) fn featurize_body_hashed(
 
     out_token_lines.reserve(n);
     out_token_end_delta.reserve(n);
+    let mut local_count = 0usize;
     for (ti, l) in scratch.leaves.iter().enumerate() {
+        local_count += l.local as usize;
         push_tok_line(
             l.line,
             l.end_line,
@@ -810,27 +811,54 @@ pub(crate) fn featurize_body_hashed(
         );
     }
 
-    scratch.counts.clear();
-    scratch.counts.resize(n, 0);
-    scratch.own_hashes.clear();
-    scratch.own_hashes.reserve(n * 4);
-    scratch.own_lens.clear();
-    scratch.own_lens.reserve(n);
-    scratch.extra.clear();
-    scratch.extra.reserve(n * 3);
+    // Usage features `U` (zero-alloc epoch table, precomputed only when >= 2 locals)
+    let has_usage = if local_count >= 2 {
+        scratch.prev_use_idx.clear();
+        scratch.prev_use_idx.resize(n, u32::MAX);
+        scratch.next_use_idx.clear();
+        scratch.next_use_idx.resize(n, u32::MAX);
+        scratch.use_hashes.clear();
+        scratch.reset_last_use(local_count);
+        for i in 0..n {
+            let leaf = unsafe { *scratch.leaves.get_unchecked(i) };
+            if !leaf.local {
+                continue;
+            }
+            let raw_bytes =
+                body.text(base, unsafe { body.items.get_unchecked(leaf.body_item as usize) });
+            if let Some(prev) = scratch.lu_replace(body, base, leaf.raw_hash, raw_bytes, i as u32) {
+                let prev_leaf = unsafe { *scratch.leaves.get_unchecked(prev) };
+                let ca = context_hash_of(body, base, &prev_leaf, &mut scratch.frames);
+                let cb = context_hash_of(body, base, &leaf, &mut scratch.frames);
+                let h = mix(mix(TAG_U, ca), cb);
+                let uid = scratch.use_hashes.len() as u32;
+                scratch.use_hashes.push(h);
+                unsafe {
+                    *scratch.next_use_idx.get_unchecked_mut(prev) = uid;
+                    *scratch.prev_use_idx.get_unchecked_mut(i) = uid;
+                }
+            }
+        }
+        !scratch.use_hashes.is_empty()
+    } else {
+        false
+    };
 
-    // Own features: `T` + up to 3 `P` ancestors
-    let mut local_count = 0usize;
+    // Single-pass sequential CSR emission directly into `out_hashes` and `out_offsets`
+    let hash_base = out_hashes.len();
+    out_offsets.reserve(n + 1);
+    out_hashes.reserve(n * 7);
+    out_offsets.push(0);
+
+    let mut prev_sib_h = 0u64;
     for i in 0..n {
         let leaf = unsafe { *scratch.leaves.get_unchecked(i) };
         let nh = leaf.name_hash;
         if leaf.local {
-            local_count += 1;
-            scratch.own_hashes.push(hash_t_var);
+            out_hashes.push(hash_t_var);
         } else {
-            scratch.own_hashes.push(mix(TAG_T, nh));
+            out_hashes.push(mix(TAG_T, nh));
         }
-        let mut own_c = 1u8;
         let p_base = mix(TAG_P, nh);
         let mut idx = leaf.index;
         let mut anc = leaf.parent;
@@ -839,76 +867,34 @@ pub(crate) fn featurize_body_hashed(
                 break;
             }
             let f = unsafe { *scratch.frames.get_unchecked(anc as usize) };
-            scratch.own_hashes.push(mix(mix(p_base, idx as u64), f.label_hash));
-            own_c += 1;
+            out_hashes.push(mix(mix(p_base, idx as u64), f.label_hash));
             idx = f.index;
             anc = f.parent;
         }
-        scratch.own_lens.push(own_c);
-        scratch.counts[i] = own_c as u32;
-    }
-
-    // Sibling features `S`
-    for i in 0..n.saturating_sub(1) {
-        let l0 = unsafe { *scratch.leaves.get_unchecked(i) };
-        let l1 = unsafe { *scratch.leaves.get_unchecked(i + 1) };
-        let h = if l0.local && l1.local {
-            hash_s_var_var
-        } else {
-            mix(mix(TAG_S, l0.name_hash), l1.name_hash)
-        };
-        scratch.extra.push((i as u32, h));
-        scratch.extra.push(((i + 1) as u32, h));
-        scratch.counts[i] += 1;
-        scratch.counts[i + 1] += 1;
-    }
-
-    // Usage features `U` (zero-alloc epoch table)
-    if local_count >= 2 {
-        scratch.reset_last_use(local_count);
-        for i in 0..n {
-            let leaf = unsafe { *scratch.leaves.get_unchecked(i) };
-            if !leaf.local {
-                continue;
+        if i > 0 {
+            out_hashes.push(prev_sib_h);
+        }
+        if i + 1 < n {
+            let next_leaf = unsafe { *scratch.leaves.get_unchecked(i + 1) };
+            let sh = if leaf.local && next_leaf.local {
+                hash_s_var_var
+            } else {
+                mix(mix(TAG_S, nh), next_leaf.name_hash)
+            };
+            out_hashes.push(sh);
+            prev_sib_h = sh;
+        }
+        if has_usage {
+            let pu = unsafe { *scratch.prev_use_idx.get_unchecked(i) };
+            if pu != u32::MAX {
+                out_hashes.push(unsafe { *scratch.use_hashes.get_unchecked(pu as usize) });
             }
-            let raw_bytes = body.text(base, unsafe { body.items.get_unchecked(leaf.body_item as usize) });
-            if let Some(prev) = scratch.lu_replace(body, base, leaf.raw_hash, raw_bytes, i as u32) {
-                let prev_leaf = unsafe { *scratch.leaves.get_unchecked(prev) };
-                let ca = context_hash_of(body, base, &prev_leaf, &mut scratch.frames);
-                let cb = context_hash_of(body, base, &leaf, &mut scratch.frames);
-                let h = mix(mix(TAG_U, ca), cb);
-                scratch.extra.push((prev as u32, h));
-                scratch.extra.push((i as u32, h));
-                scratch.counts[prev] += 1;
-                scratch.counts[i] += 1;
+            let nu = unsafe { *scratch.next_use_idx.get_unchecked(i) };
+            if nu != u32::MAX {
+                out_hashes.push(unsafe { *scratch.use_hashes.get_unchecked(nu as usize) });
             }
         }
-    }
-
-    // Pack into CSR (`out_offsets`, `out_hashes`)
-    let hash_base = out_hashes.len();
-    let mut total = 0usize;
-    let off_base = out_offsets.len();
-    out_offsets.reserve(n + 1);
-    for &c in &scratch.counts[..n] {
-        out_offsets.push(total as u32);
-        total += c as usize;
-    }
-    out_offsets.push(total as u32);
-    out_hashes.resize(hash_base + total, 0u64);
-
-    let mut own_pos = 0usize;
-    for i in 0..n {
-        let dst = hash_base + out_offsets[off_base + i] as usize;
-        let len = scratch.own_lens[i] as usize;
-        out_hashes[dst..dst + len].copy_from_slice(&scratch.own_hashes[own_pos..own_pos + len]);
-        own_pos += len;
-        scratch.counts[i] = (dst + len) as u32;
-    }
-    for &(tok, h) in &scratch.extra {
-        let p = scratch.counts[tok as usize] as usize;
-        unsafe { *out_hashes.get_unchecked_mut(p) = h };
-        scratch.counts[tok as usize] = (p + 1) as u32;
+        out_offsets.push((out_hashes.len() - hash_base) as u32);
     }
 
     n

@@ -508,7 +508,7 @@ fn render_recommendation(
     }
 
     // Extract only the needed lines from `source` using `memchr`
-    let source = &index.sources[loc.file_id as usize].source;
+    let source = index.sources.source(loc.file_id);
     let bytes = source.as_bytes();
     let max_line = line_roles.last().unwrap().0 as usize;
 
