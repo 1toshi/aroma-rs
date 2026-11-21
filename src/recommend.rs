@@ -4,8 +4,8 @@
 use rustc_hash::FxHashMap;
 
 use crate::index::{AromaIndex, LanguageIndex, MethodLocation, Query};
-use crate::prune::{prune_fast, PruneScratch, PruneTarget};
-use crate::search::{rank_for_recommend, DEFAULT_SEARCH_LIMIT, TL_SEARCH};
+use crate::prune::prune_fast;
+use crate::search::{rank_for_recommend, SearchScratch, DEFAULT_SEARCH_LIMIT, TL_SEARCH};
 use crate::text::{drop_chars, js_indent, js_trim, js_trim_end};
 use crate::MethodRef;
 
@@ -60,26 +60,48 @@ pub struct Recommendation {
     pub code: String,
 }
 
-/// Compact sorted multiset of `(feature_id, count)` with cached total weight.
-struct SortedMultiset {
-    pairs: Vec<(u32, u32)>,
+/// Range `(start, end, total)` in a shared multiset pool (`u32::MAX` start = unbuilt).
+#[derive(Clone, Copy)]
+struct PoolRange {
+    start: u32,
+    end: u32,
     total: usize,
 }
 
-fn build_multiset_from_slice(feats: &[u32], tmp: &mut Vec<u32>) -> SortedMultiset {
+fn push_rle_to_pool(sorted: &[u32], pool: &mut Vec<(u32, u32)>) -> PoolRange {
+    let start = pool.len() as u32;
+    let mut i = 0;
+    while i < sorted.len() {
+        let f = unsafe { *sorted.get_unchecked(i) };
+        let mut j = i + 1;
+        while j < sorted.len() && unsafe { *sorted.get_unchecked(j) } == f {
+            j += 1;
+        }
+        pool.push((f, (j - i) as u32));
+        i = j;
+    }
+    PoolRange { start, end: pool.len() as u32, total: sorted.len() }
+}
+
+fn build_multiset_into_pool(
+    feats: &[u32],
+    tmp: &mut Vec<u32>,
+    pool: &mut Vec<(u32, u32)>,
+) -> PoolRange {
     tmp.clear();
     tmp.extend_from_slice(feats);
     tmp.sort_unstable();
-    rle_to_multiset(tmp)
+    push_rle_to_pool(tmp, pool)
 }
 
-fn build_multiset_from_tokens(
+fn build_tokens_multiset_into_pool(
     all_features: &[u32],
     offsets: &[u32],
     feat_base: usize,
     tokens: &[usize],
     tmp: &mut Vec<u32>,
-) -> SortedMultiset {
+    pool: &mut Vec<(u32, u32)>,
+) -> PoolRange {
     tmp.clear();
     for &t in tokens {
         let s = feat_base + offsets[t] as usize;
@@ -87,22 +109,7 @@ fn build_multiset_from_tokens(
         tmp.extend_from_slice(&all_features[s..e]);
     }
     tmp.sort_unstable();
-    rle_to_multiset(tmp)
-}
-
-fn rle_to_multiset(sorted: &[u32]) -> SortedMultiset {
-    let mut pairs = Vec::with_capacity(sorted.len());
-    let mut i = 0;
-    while i < sorted.len() {
-        let f = sorted[i];
-        let mut j = i + 1;
-        while j < sorted.len() && sorted[j] == f {
-            j += 1;
-        }
-        pairs.push((f, (j - i) as u32));
-        i = j;
-    }
-    SortedMultiset { pairs, total: sorted.len() }
+    push_rle_to_pool(tmp, pool)
 }
 
 /// Two-pointer multiset intersection size with early exit when remaining weight
@@ -197,52 +204,90 @@ fn jaccard(a: &[usize], b: &[usize]) -> f64 {
     shared as f64 / (a.len() + b.len() - shared) as f64
 }
 
+#[inline]
+fn ensure_whole_range(
+    idx: usize,
+    cand_mids: &[u32],
+    lidx: &LanguageIndex,
+    whole_ranges: &mut [PoolRange],
+    whole_pool: &mut Vec<(u32, u32)>,
+    tmp: &mut Vec<u32>,
+) -> (usize, usize) {
+    let r = unsafe { *whole_ranges.get_unchecked(idx) };
+    if r.start != u32::MAX {
+        return (r.start as usize, r.end as usize);
+    }
+    let mid = cand_mids[idx] as usize;
+    let built = build_multiset_into_pool(lidx.method_features(mid), tmp, whole_pool);
+    whole_ranges[idx] = built;
+    (built.start as usize, built.end as usize)
+}
+
 fn cluster(
-    whole: &[SortedMultiset],
-    query_like: &[SortedMultiset],
+    lidx: &LanguageIndex,
+    cand_mids: &[u32],
+    whole_ranges: &mut [PoolRange],
+    ql_ranges: &[PoolRange],
     options: &RecommendOptions<'_>,
-) -> Vec<Vec<usize>> {
-    let n = whole.len();
-    let mut raw_clusters: Vec<Vec<usize>> = Vec::new();
-    let mut shared = Vec::new();
-    let mut shared_ql = Vec::new();
-    let mut next_shared = Vec::new();
-    let mut next_ql = Vec::new();
+    sc: &mut SearchScratch,
+) -> Vec<(usize, usize)> {
+    let n = cand_mids.len();
+    sc.rec_cluster_pool.clear();
+    let mut raw_ranges: Vec<(usize, usize)> = Vec::with_capacity(n);
+
+    let shared = &mut sc.rec_shared;
+    let shared_ql = &mut sc.rec_shared_ql;
+    let next_shared = &mut sc.rec_next_shared;
+    let next_ql = &mut sc.rec_next_ql;
+    let tmp_sort = &mut sc.rec_tmp_sort;
+    let ql_pool = &sc.rec_ql_pool;
+    let whole_pool = &mut sc.rec_whole_pool;
 
     for seed in 0..n {
-        let seed_size = query_like[seed].total;
-        if seed_size == 0 || (whole[seed].total as f64 / seed_size as f64) <= options.min_expansion {
+        let seed_ql = ql_ranges[seed];
+        let seed_size = seed_ql.total;
+        let seed_whole_total = whole_ranges[seed].total;
+        if seed_size == 0 || (seed_whole_total as f64 / seed_size as f64) <= options.min_expansion {
             continue;
         }
-        let mut members = vec![seed];
-        shared.clear();
-        shared.extend_from_slice(&whole[seed].pairs);
+        let c_start = sc.rec_cluster_pool.len();
+        sc.rec_cluster_pool.push(seed);
+        let mut last_member = seed;
+        let mut seed_whole_loaded = false;
         shared_ql.clear();
-        shared_ql.extend_from_slice(&query_like[seed].pairs);
+        shared_ql.extend_from_slice(&ql_pool[seed_ql.start as usize..seed_ql.end as usize]);
         let mut shared_ql_total = seed_size;
-        let mut shared_total = whole[seed].total;
+        let mut shared_total = seed_whole_total;
         let min_csq_f64 = options.min_cohesion * seed_size as f64;
 
         loop {
             let mut best_member: Option<usize> = None;
             let mut best_expansion = 0.0f64;
-            let start = *members.last().unwrap() + 1;
+            let start = last_member + 1;
 
             for member in start..n {
-                // Fast upper-bound checks before scanning sorted slices
-                if (shared_ql_total.min(query_like[member].total) as f64) <= min_csq_f64 {
+                let m_ql = ql_ranges[member];
+                if (shared_ql_total.min(m_ql.total) as f64) <= min_csq_f64 {
                     continue;
                 }
-                let csq = intersection_size(&shared_ql, &query_like[member].pairs);
+                let m_ql_slice = &ql_pool[m_ql.start as usize..m_ql.end as usize];
+                let csq = intersection_size(shared_ql, m_ql_slice);
                 if csq == 0 || (csq as f64 / seed_size as f64) <= options.min_cohesion {
                     continue;
                 }
-                let max_cs = shared_total.min(whole[member].total);
+                let max_cs = shared_total.min(whole_ranges[member].total);
                 let needed_exp = best_expansion.max(options.min_expansion);
                 if (max_cs as f64 / csq as f64) <= needed_exp {
                     continue;
                 }
-                let cs = intersection_size(&shared, &whole[member].pairs);
+                if !seed_whole_loaded {
+                    let (ws, we) = ensure_whole_range(seed, cand_mids, lidx, whole_ranges, whole_pool, tmp_sort);
+                    shared.clear();
+                    shared.extend_from_slice(&whole_pool[ws..we]);
+                    seed_whole_loaded = true;
+                }
+                let (ms, me) = ensure_whole_range(member, cand_mids, lidx, whole_ranges, whole_pool, tmp_sort);
+                let cs = intersection_size(shared, &whole_pool[ms..me]);
                 let expansion = cs as f64 / csq as f64;
                 if expansion > options.min_expansion && expansion > best_expansion {
                     best_expansion = expansion;
@@ -251,28 +296,62 @@ fn cluster(
             }
 
             let Some(m) = best_member else { break };
-            members.push(m);
-            shared_total = intersect_multisets(&shared, &whole[m].pairs, &mut next_shared);
-            std::mem::swap(&mut shared, &mut next_shared);
-            shared_ql_total = intersect_multisets(&shared_ql, &query_like[m].pairs, &mut next_ql);
-            std::mem::swap(&mut shared_ql, &mut next_ql);
+            sc.rec_cluster_pool.push(m);
+            last_member = m;
+            let (ms, me) = ensure_whole_range(m, cand_mids, lidx, whole_ranges, whole_pool, tmp_sort);
+            shared_total = intersect_multisets(shared, &whole_pool[ms..me], next_shared);
+            std::mem::swap(shared, next_shared);
+            let m_ql = ql_ranges[m];
+            shared_ql_total = intersect_multisets(
+                shared_ql,
+                &ql_pool[m_ql.start as usize..m_ql.end as usize],
+                next_ql,
+            );
+            std::mem::swap(shared_ql, next_ql);
         }
-        raw_clusters.push(members);
+        raw_ranges.push((c_start, sc.rec_cluster_pool.len()));
     }
 
-    // Dedup: keep `raw_clusters[pos]` iff jaccard with EVERY earlier cluster (including dropped ones) <= max_cluster_overlap
+    // Dedup: keep `raw_ranges[pos]` iff jaccard with EVERY earlier cluster (including dropped ones) <= max_cluster_overlap
     let mut kept = Vec::new();
-    for pos in 0..raw_clusters.len() {
-        let cur = &raw_clusters[pos];
-        let mut ok = true;
-        for earlier in &raw_clusters[..pos] {
-            if jaccard(earlier, cur) > options.max_cluster_overlap {
-                ok = false;
-                break;
+    if n <= 128 {
+        let mut masks: Vec<u128> = Vec::with_capacity(raw_ranges.len());
+        for &(cs, ce) in &raw_ranges {
+            let mut m = 0u128;
+            for &idx in &sc.rec_cluster_pool[cs..ce] {
+                m |= 1u128 << idx;
+            }
+            masks.push(m);
+        }
+        for pos in 0..raw_ranges.len() {
+            let cm = masks[pos];
+            let mut ok = true;
+            for &em in &masks[..pos] {
+                let shared_cnt = (em & cm).count_ones();
+                let union_cnt = (em | cm).count_ones();
+                if (shared_cnt as f64 / union_cnt as f64) > options.max_cluster_overlap {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                kept.push(raw_ranges[pos]);
             }
         }
-        if ok {
-            kept.push(cur.clone());
+    } else {
+        for pos in 0..raw_ranges.len() {
+            let (cs, ce) = raw_ranges[pos];
+            let cur = &sc.rec_cluster_pool[cs..ce];
+            let mut ok = true;
+            for &(es, ee) in &raw_ranges[..pos] {
+                if jaccard(&sc.rec_cluster_pool[es..ee], cur) > options.max_cluster_overlap {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                kept.push(raw_ranges[pos]);
+            }
         }
     }
     kept
@@ -282,10 +361,9 @@ fn intersect_cluster(
     lidx: &LanguageIndex,
     members: &[usize],
     candidate_mids: &[u32],
-    whole: &[SortedMultiset],
+    whole_ranges: &[PoolRange],
     query: &Query,
-    target: &mut PruneTarget,
-    scratch: &mut PruneScratch,
+    sc: &mut SearchScratch,
 ) -> Vec<usize> {
     let first_mid = candidate_mids[members[0]] as usize;
     let first_m = &lidx.methods[first_mid];
@@ -296,19 +374,20 @@ fn intersect_cluster(
     let offsets = lidx.method_offsets(first_mid);
     let feat_base = first_m.feat_start as usize;
     let mut kept: Option<Vec<usize>> = None;
-    let mut sum_pairs: Vec<(u32, u32)> = Vec::new();
 
     for &m_idx in &members[1..] {
-        add_multisets(&whole[m_idx].pairs, &query.features, &mut sum_pairs);
-        target.build_from_pairs(&sum_pairs);
+        let wr = whole_ranges[m_idx];
+        let w_pairs = &sc.rec_whole_pool[wr.start as usize..wr.end as usize];
+        add_multisets(w_pairs, &query.features, &mut sc.rec_sum_pairs);
+        sc.prune_target.build_from_pairs(&sc.rec_sum_pairs);
         let p = prune_fast(
-            target,
+            &sc.prune_target,
             &lidx.all_features,
             offsets,
             feat_base,
             None,
             kept.as_deref(),
-            scratch,
+            &mut sc.prune_scratch,
         );
         kept = Some(p.tokens);
     }
@@ -323,43 +402,106 @@ fn render_recommendation(
     kept: &[usize],
     query_like_tokens: &[usize],
 ) -> (Vec<RecommendedLine>, String) {
-    let mut roles: FxHashMap<u32, LineRole> = FxHashMap::default();
-
-    // Build fast membership bitset/sorted check for `query_like_tokens` (both `kept` and `query_like_tokens` are sorted ascending!)
-    let mut ql_i = 0usize;
-    for &tok in kept {
-        while ql_i < query_like_tokens.len() && query_like_tokens[ql_i] < tok {
-            ql_i += 1;
-        }
-        let is_ql = ql_i < query_like_tokens.len() && query_like_tokens[ql_i] == tok;
-        let new_role = if is_ql { LineRole::Query } else { LineRole::Added };
-        let (s_ln, e_ln) = lidx.tok_line_span(loc, tok);
-        for ln in s_ln..=e_ln {
-            match roles.get(&ln) {
-                Some(LineRole::Added) => {}
-                _ => {
-                    roles.insert(ln, new_role);
+    let base = loc.start_line;
+    let span = loc.end_line.saturating_sub(base) + 1;
+    let line_roles: Vec<(u32, LineRole)> = if span <= 512 {
+        // Stack array avoids FxHashMap allocations and sorting for < 512 line methods.
+        // 0 = none, 1 = Query, 2 = Added, 3 = Structure
+        let mut roles = [0u8; 512];
+        let mut overflow: Option<FxHashMap<u32, LineRole>> = None;
+        let mut ql_i = 0usize;
+        for &tok in kept {
+            while ql_i < query_like_tokens.len() && query_like_tokens[ql_i] < tok {
+                ql_i += 1;
+            }
+            let is_ql = ql_i < query_like_tokens.len() && query_like_tokens[ql_i] == tok;
+            let new_code = if is_ql { 1u8 } else { 2u8 };
+            let (s_ln, e_ln) = lidx.tok_line_span(loc, tok);
+            for ln in s_ln..=e_ln {
+                let rel = ln.wrapping_sub(base);
+                if rel < 512 {
+                    let slot = unsafe { roles.get_unchecked_mut(rel as usize) };
+                    if *slot != 2 {
+                        *slot = new_code;
+                    }
+                } else {
+                    let map = overflow.get_or_insert_with(FxHashMap::default);
+                    let new_role = if is_ql { LineRole::Query } else { LineRole::Added };
+                    if !matches!(map.get(&ln), Some(LineRole::Added)) {
+                        map.insert(ln, new_role);
+                    }
                 }
             }
         }
-    }
-
-    // Mark structure lines from precomputed `StructSpan`s:
-    // A span `(tok_start, tok_end, line)` triggers iff some `t in kept` satisfies `tok_start <= t < tok_end`.
-    if !kept.is_empty() {
-        for sp in lidx.location_spans(loc) {
-            if roles.contains_key(&sp.line) {
-                continue;
-            }
-            let pos = kept.partition_point(|&t| (t as u32) < sp.tok_start);
-            if pos < kept.len() && (kept[pos] as u32) < sp.tok_end {
-                roles.insert(sp.line, LineRole::Structure);
+        if !kept.is_empty() {
+            for sp in lidx.location_spans(loc) {
+                let rel = sp.line.wrapping_sub(base);
+                if rel < 512 {
+                    if unsafe { *roles.get_unchecked(rel as usize) } != 0 {
+                        continue;
+                    }
+                } else if overflow.as_ref().is_some_and(|m| m.contains_key(&sp.line)) {
+                    continue;
+                }
+                let pos = kept.partition_point(|&t| (t as u32) < sp.tok_start);
+                if pos < kept.len() && (kept[pos] as u32) < sp.tok_end {
+                    if rel < 512 {
+                        unsafe { *roles.get_unchecked_mut(rel as usize) = 3 };
+                    } else {
+                        overflow.get_or_insert_with(FxHashMap::default).insert(sp.line, LineRole::Structure);
+                    }
+                }
             }
         }
-    }
-
-    let mut line_roles: Vec<(u32, LineRole)> = roles.into_iter().collect();
-    line_roles.sort_unstable_by_key(|&(ln, _)| ln);
+        let mut out = Vec::new();
+        for (rel, &code) in roles[..span as usize].iter().enumerate() {
+            let role = match code {
+                1 => LineRole::Query,
+                2 => LineRole::Added,
+                3 => LineRole::Structure,
+                _ => continue,
+            };
+            out.push((base + rel as u32, role));
+        }
+        if let Some(extra) = overflow {
+            out.extend(extra);
+            out.sort_unstable_by_key(|&(ln, _)| ln);
+        }
+        out
+    } else {
+        let mut roles: FxHashMap<u32, LineRole> = FxHashMap::default();
+        let mut ql_i = 0usize;
+        for &tok in kept {
+            while ql_i < query_like_tokens.len() && query_like_tokens[ql_i] < tok {
+                ql_i += 1;
+            }
+            let is_ql = ql_i < query_like_tokens.len() && query_like_tokens[ql_i] == tok;
+            let new_role = if is_ql { LineRole::Query } else { LineRole::Added };
+            let (s_ln, e_ln) = lidx.tok_line_span(loc, tok);
+            for ln in s_ln..=e_ln {
+                match roles.get(&ln) {
+                    Some(LineRole::Added) => {}
+                    _ => {
+                        roles.insert(ln, new_role);
+                    }
+                }
+            }
+        }
+        if !kept.is_empty() {
+            for sp in lidx.location_spans(loc) {
+                if roles.contains_key(&sp.line) {
+                    continue;
+                }
+                let pos = kept.partition_point(|&t| (t as u32) < sp.tok_start);
+                if pos < kept.len() && (kept[pos] as u32) < sp.tok_end {
+                    roles.insert(sp.line, LineRole::Structure);
+                }
+            }
+        }
+        let mut out: Vec<(u32, LineRole)> = roles.into_iter().collect();
+        out.sort_unstable_by_key(|&(ln, _)| ln);
+        out
+    };
 
     if line_roles.is_empty() {
         return (Vec::new(), String::new());
@@ -455,39 +597,55 @@ pub fn recommend(
             return Vec::new();
         }
 
-        let mut tmp_sort: Vec<u32> = Vec::new();
-        let mut whole: Vec<SortedMultiset> = Vec::with_capacity(candidates.len());
-        let mut query_like: Vec<SortedMultiset> = Vec::with_capacity(candidates.len());
-        let mut cand_mids: Vec<u32> = Vec::with_capacity(candidates.len());
+        let n = candidates.len();
+        sc.rec_ql_pool.clear();
+        sc.rec_whole_pool.clear();
+        let mut whole_ranges: Vec<PoolRange> = Vec::with_capacity(n);
+        let mut ql_ranges: Vec<PoolRange> = Vec::with_capacity(n);
+        let mut cand_mids: Vec<u32> = Vec::with_capacity(n);
 
         for c in &candidates {
             let mid = c.mid as usize;
             cand_mids.push(c.mid);
-            whole.push(build_multiset_from_slice(lidx.method_features(mid), &mut tmp_sort));
+            whole_ranges.push(PoolRange {
+                start: u32::MAX,
+                end: 0,
+                total: lidx.method_features(mid).len(),
+            });
             let m = &lidx.methods[mid];
             let offsets = lidx.method_offsets(mid);
-            query_like.push(build_multiset_from_tokens(
+            ql_ranges.push(build_tokens_multiset_into_pool(
                 &lidx.all_features,
                 offsets,
                 m.feat_start as usize,
                 &c.pruned.tokens,
-                &mut tmp_sort,
+                &mut sc.rec_tmp_sort,
+                &mut sc.rec_ql_pool,
             ));
         }
 
-        let clusters = cluster(&whole, &query_like, options);
+        let clusters = cluster(
+            lidx,
+            &cand_mids,
+            &mut whole_ranges,
+            &ql_ranges,
+            options,
+            sc,
+        );
         let mut out = Vec::new();
 
-        for members in clusters.into_iter().filter(|m| m.len() >= options.min_support).take(options.limit) {
-            let first = &candidates[members[0]];
+        for (cs, ce) in clusters.into_iter().filter(|&(cs, ce)| ce - cs >= options.min_support).take(options.limit) {
+            let first_idx = sc.rec_cluster_pool[cs];
+            let first = &candidates[first_idx];
+            // Copy small member slice out so `intersect_cluster` can mutably borrow `sc`.
+            let members: Vec<usize> = sc.rec_cluster_pool[cs..ce].to_vec();
             let kept = intersect_cluster(
                 lidx,
                 &members,
                 &cand_mids,
-                &whole,
+                &whole_ranges,
                 query,
-                &mut sc.prune_target,
-                &mut sc.prune_scratch,
+                sc,
             );
             let (lines, code) =
                 render_recommendation(index, lidx, first.loc, &kept, &first.pruned.tokens);

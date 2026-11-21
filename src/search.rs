@@ -73,6 +73,15 @@ pub(crate) struct SearchScratch {
     pub fast_qmap: FastQueryMap,
     pub prune_target: PruneTarget,
     pub prune_scratch: PruneScratch,
+    pub rec_tmp_sort: Vec<u32>,
+    pub rec_sum_pairs: Vec<(u32, u32)>,
+    pub rec_shared: Vec<(u32, u32)>,
+    pub rec_shared_ql: Vec<(u32, u32)>,
+    pub rec_next_shared: Vec<(u32, u32)>,
+    pub rec_next_ql: Vec<(u32, u32)>,
+    pub rec_ql_pool: Vec<(u32, u32)>,
+    pub rec_whole_pool: Vec<(u32, u32)>,
+    pub rec_cluster_pool: Vec<usize>,
 }
 
 thread_local! {
