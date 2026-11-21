@@ -31,6 +31,45 @@ pub(crate) struct Body {
     scratch: Vec<u32>,
 }
 
+const DK1: u64 = 0x9e37_79b9_7f4a_7c15;
+const DK2: u64 = 0xc2b2_ae3d_27d4_eb4f;
+const DK3: u64 = 0x1656_67b1_9e37_79f9;
+
+#[inline(always)]
+fn digest_hash_bytes(b: &[u8]) -> u64 {
+    let len = b.len();
+    if len <= 8 {
+        let mut buf = [0u8; 8];
+        match len {
+            0 => return 0x9e37_79b9_7f4a_7c15,
+            1 => buf[0] = b[0],
+            2 => {
+                buf[0] = b[0];
+                buf[1] = b[1];
+            }
+            3 => {
+                buf[0] = b[0];
+                buf[1] = b[1];
+                buf[2] = b[2];
+            }
+            4 => buf[..4].copy_from_slice(b),
+            5..=7 => buf[..len].copy_from_slice(b),
+            8 => buf.copy_from_slice(b),
+            _ => unreachable!(),
+        }
+        let t = ((u64::from_le_bytes(buf) ^ 0xa076_1d64_78bd_642f) as u128)
+            .wrapping_mul(((len as u64) ^ 0xe703_7ed1_a0b4_28db) as u128);
+        return (t as u64) ^ ((t >> 64) as u64);
+    }
+    xxhash_rust::xxh3::xxh3_64(b)
+}
+
+#[inline(always)]
+fn dg_step(d1: &mut u64, d2: &mut u64, x: u64) {
+    *d1 = (d1.rotate_left(23) ^ x).wrapping_mul(DK1);
+    *d2 = (d2.rotate_left(31) ^ x.wrapping_mul(DK2)).wrapping_mul(DK3);
+}
+
 impl Body {
     pub fn clear(&mut self) {
         self.items.clear();
@@ -39,35 +78,38 @@ impl Body {
         self.scratch.clear();
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn text<'s>(&'s self, base: &'s [u8], it: &Item) -> &'s [u8] {
         if it.a & SIDE != 0 {
-            &self.side[(it.a & !SIDE) as usize..(it.b & !SIDE) as usize]
+            unsafe { self.side.get_unchecked((it.a & !SIDE) as usize..(it.b & !SIDE) as usize) }
         } else {
-            &base[it.a as usize..it.b as usize]
+            unsafe { base.get_unchecked(it.a as usize..it.b as usize) }
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn children(&self, it: &Item) -> &[u32] {
-        &self.kids[it.a as usize..it.b as usize]
+        unsafe { self.kids.get_unchecked(it.a as usize..it.b as usize) }
     }
 
+    #[inline(always)]
     fn push(&mut self, it: Item) -> u32 {
+        let id = self.items.len() as u32;
         self.items.push(it);
-        (self.items.len() - 1) as u32
+        id
     }
 
     /// Collapses the children above `mark` on the scratch stack into a node
     /// (Section 3.1: no empty lists, no list of a single subtree or name).
+    #[inline]
     fn close(&mut self, mark: usize) -> Option<u32> {
         let n = self.scratch.len() - mark;
         if n == 0 {
             return None;
         }
         if n == 1 {
-            let only = self.scratch[mark];
-            let it = &self.items[only as usize];
+            let only = unsafe { *self.scratch.get_unchecked(mark) };
+            let it = unsafe { self.items.get_unchecked(only as usize) };
             if it.kind != KW {
                 self.scratch.truncate(mark);
                 return Some(only);
@@ -122,72 +164,74 @@ impl Body {
         }
     }
 
-    /// The deduplication key of a method: a 128-bit hash of its tokens, which
-    /// are keywords and locals, and how they nest.
+    /// The deduplication key of a method: a fast register-only 128-bit hash of
+    /// its tokens, which are keywords and locals, and how they nest.
     pub fn digest(&self, base: &[u8], root: u32) -> u128 {
-        let mut h = xxhash_rust::xxh3::Xxh3::new();
-        self.digest_rec(base, root, &mut h);
-        h.digest128()
+        let mut d1 = 0x1234_5678_9abc_def0u64;
+        let mut d2 = 0x0fed_cba9_8765_4321u64;
+        self.digest_rec(base, root, &mut d1, &mut d2);
+        ((d1 as u128) << 64) | (d2 as u128)
     }
 
-    fn digest_rec(&self, base: &[u8], n: u32, h: &mut xxhash_rust::xxh3::Xxh3) {
-        let it = &self.items[n as usize];
-        match it.kind {
-            TREE => {
-                h.update(b"(");
-                for &c in self.children(it) {
-                    self.digest_rec(base, c, h);
-                }
-                h.update(b")");
+    fn digest_rec(&self, base: &[u8], n: u32, d1: &mut u64, d2: &mut u64) {
+        let it = unsafe { self.items.get_unchecked(n as usize) };
+        if it.kind == TREE {
+            dg_step(d1, d2, 0x28);
+            for &c in self.children(it) {
+                self.digest_rec(base, c, d1, d2);
             }
-            k => {
-                h.update(if k == KW {
-                    b"k"
-                } else if it.local {
-                    b"l"
-                } else {
-                    b"n"
-                });
-                h.update(self.text(base, it));
-                h.update(b"\0");
-            }
+            dg_step(d1, d2, 0x29);
+        } else {
+            let tag = if it.kind == KW {
+                0x6bu64 << 56
+            } else if it.local {
+                0x6cu64 << 56
+            } else {
+                0x6eu64 << 56
+            };
+            let th = digest_hash_bytes(self.text(base, it));
+            dg_step(d1, d2, th ^ tag);
         }
     }
 }
 
+const F_NAME: u8 = 1;
+const F_TEXT: u8 = 2;
+const F_COMMENT: u8 = 4;
+const F_EXPRSTMT: u8 = 8;
+const F_DOCSTR: u8 = 16;
+
 /// What a Lezer grammar's node types mean for a simplified tree (`Grammar` in lezer.ts).
+/// Packed into a single `u8` flags byte per node type so `Simplifier::convert`
+/// performs ONE table load per syntax node.
 pub(crate) struct Cfg {
-    pub names: Vec<bool>,
-    pub text: Vec<bool>,
-    pub comments: Vec<bool>,
-    /// Python: ExpressionStatement / String / ContinuedString type ids for docstring skipping.
-    pub docstring: Option<(u16, u16, u16)>,
+    pub flags: Vec<u8>,
 }
 
 impl Cfg {
     pub fn new(node_names: &[&str], names: &[&str], text: &[&str], comments: &[&str], docstring: bool) -> Cfg {
-        let flag = |set: &[&str]| node_names.iter().map(|n| set.contains(n)).collect::<Vec<bool>>();
-        let id = |name: &str| node_names.iter().position(|n| *n == name).unwrap() as u16;
-        Cfg {
-            names: flag(names),
-            text: flag(text),
-            comments: flag(comments),
-            docstring: if docstring { Some((id("ExpressionStatement"), id("String"), id("ContinuedString"))) } else { None },
-        }
-    }
-
-    #[inline]
-    fn skip(&self, tree: &SyntaxTree, n: u32) -> bool {
-        if let Some((stmt, s1, s2)) = self.docstring
-            && tree.ty(n) == stmt
-        {
-            let first = tree.first_child(n);
-            if first != NONE && tree.next_sibling(first) == NONE {
-                let t = tree.ty(first);
-                return t == s1 || t == s2;
+        let mut flags = vec![0u8; node_names.len()];
+        for (i, &n) in node_names.iter().enumerate() {
+            let mut f = 0u8;
+            if names.contains(&n) {
+                f |= F_NAME;
             }
+            if text.contains(&n) {
+                f |= F_TEXT;
+            }
+            if comments.contains(&n) {
+                f |= F_COMMENT;
+            }
+            if docstring {
+                if n == "ExpressionStatement" {
+                    f |= F_EXPRSTMT;
+                } else if n == "String" || n == "ContinuedString" {
+                    f |= F_DOCSTR;
+                }
+            }
+            flags[i] = f;
         }
-        false
+        Cfg { flags }
     }
 }
 
@@ -208,10 +252,20 @@ impl<F: Fn(u32) -> bool> Simplifier<'_, '_, F> {
         r
     }
 
-    #[inline]
-    fn token(&self, body: &mut Body, from: u32, to: u32, keyword: bool, local: bool, line_cur: &mut usize) -> u32 {
-        let (a, b) = if keyword { (from, to) } else { self.src.trim(from, to) };
-        let (ta, tb) = self.src.text_ref(a, b, &mut body.side);
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn push_token(
+        &self,
+        body: &mut Body,
+        from: u32,
+        to: u32,
+        ta_u: u32,
+        tb_u: u32,
+        keyword: bool,
+        local: bool,
+        line_cur: &mut usize,
+    ) -> u32 {
+        let (ta, tb) = self.src.text_ref(ta_u, tb_u, &mut body.side);
         let line = self.src.line_of_cursor(from, line_cur);
         let end_off = from.max(to.saturating_sub(1));
         let end_line = if end_off == from {
@@ -225,52 +279,65 @@ impl<F: Fn(u32) -> bool> Simplifier<'_, '_, F> {
     fn convert(&self, body: &mut Body, n: u32, line_cur: &mut usize) -> Option<u32> {
         let tree = self.tree;
         let ty = tree.ty(n) as usize;
-        if self.cfg.comments[ty] || self.cfg.skip(tree, n) {
+        let fl = unsafe { *self.cfg.flags.get_unchecked(ty) };
+        if (fl & F_COMMENT) != 0 {
             return None;
         }
+        if (fl & F_EXPRSTMT) != 0 {
+            let first = tree.first_child(n);
+            if first != NONE
+                && tree.next_sibling(first) == NONE
+                && (unsafe { *self.cfg.flags.get_unchecked(tree.ty(first) as usize) } & F_DOCSTR) != 0
+            {
+                return None;
+            }
+        }
         let (from, to) = (tree.from(n), tree.to(n));
-        if self.cfg.names[ty] {
+        if (fl & F_NAME) != 0 {
             let (a, b) = self.src.trim(from, to);
             if a >= b {
                 return None;
             }
             let local = (self.is_local)(n);
-            return Some(self.token(body, from, to, false, local, line_cur));
+            return Some(self.push_token(body, from, to, a, b, false, local, line_cur));
         }
         let first = tree.first_child(n);
         if first == NONE {
-            return if from == to {
-                None
-            } else {
-                Some(self.token(body, from, to, !tree.is_error(n), false, line_cur))
-            };
+            if from == to {
+                return None;
+            }
+            let is_kw = !tree.is_error(n);
+            let (a, b) = if is_kw { (from, to) } else { self.src.trim(from, to) };
+            return Some(self.push_token(body, from, to, a, b, is_kw, false, line_cur));
         }
         let mark = body.scratch.len();
-        let literal = self.cfg.text[ty];
+        let literal = (fl & F_TEXT) != 0;
         let mut at = from;
         let mut c = first;
         while c != NONE {
-            self.gap(body, literal, at, tree.from(c), line_cur);
+            let cf = tree.from(c);
+            if at < cf {
+                self.gap(body, literal, at, cf, line_cur);
+            }
             at = tree.to(c);
             if let Some(x) = self.convert(body, c, line_cur) {
                 body.scratch.push(x);
             }
             c = tree.next_sibling(c);
         }
-        self.gap(body, literal, at, to, line_cur);
+        if at < to {
+            self.gap(body, literal, at, to, line_cur);
+        }
         body.close(mark)
     }
 
     #[inline]
     fn gap(&self, body: &mut Body, literal: bool, start: u32, end: u32, line_cur: &mut usize) {
-        if start >= end {
-            return;
-        }
         let src = self.src;
         if literal {
             let (a, b) = src.trim(start, end);
             if a < b {
-                let t = self.token(body, start, end, false, false, line_cur);
+                let t = self.push_token(body, start, end, a, b, false, false, line_cur);
                 body.scratch.push(t);
             }
             return;
@@ -279,6 +346,12 @@ impl<F: Fn(u32) -> bool> Simplifier<'_, '_, F> {
             let bytes = src.text.as_bytes();
             let mut i = start as usize;
             let e = end as usize;
+            if i + 1 == e {
+                let b = unsafe { *bytes.get_unchecked(i) };
+                if b == b' ' || b == b'\n' || b == b'\t' || b == b'\r' {
+                    return;
+                }
+            }
             while i < e {
                 while i < e {
                     let b = unsafe { *bytes.get_unchecked(i) };
@@ -299,7 +372,7 @@ impl<F: Fn(u32) -> bool> Simplifier<'_, '_, F> {
                     i += 1;
                 }
                 if !(i - s == 1 && unsafe { *bytes.get_unchecked(s) } == b'\\') {
-                    let t = self.token(body, s as u32, i as u32, true, false, line_cur);
+                    let t = self.push_token(body, s as u32, i as u32, s as u32, i as u32, true, false, line_cur);
                     body.scratch.push(t);
                 }
             }
@@ -318,7 +391,7 @@ impl<F: Fn(u32) -> bool> Simplifier<'_, '_, F> {
                 i += 1;
             }
             if !(i - s == 1 && src.unit(s) == b'\\' as u32) {
-                let t = self.token(body, s, i, true, false, line_cur);
+                let t = self.push_token(body, s, i, s, i, true, false, line_cur);
                 body.scratch.push(t);
             }
         }

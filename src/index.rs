@@ -13,7 +13,7 @@ use crate::lang_py::{self, FastMethod};
 use crate::lang_ts;
 use crate::lezer;
 use crate::simple::Body;
-use crate::text::utf16_len;
+use crate::text::utf16_len_exceeds;
 use crate::{builtin_languages, Language, MethodRef, SnippetOptions, SourceFile};
 
 pub(crate) const SHARDS: usize = 32;
@@ -325,16 +325,22 @@ thread_local! {
 fn parse_file_into_body(
     lang: &dyn Language,
     file: &SourceFile,
+    line_range: Option<(u32, u32)>,
     body: &mut Body,
     out: &mut Vec<FastMethod>,
 ) {
     body.clear();
     out.clear();
     match lang.builtin_kind() {
-        1 => lang_py::parse_methods_into(&file.source, body, out),
-        2 => lang_ts::parse_methods_into(&file.source, &file.path, body, out),
+        1 => lang_py::parse_methods_into(&file.source, line_range, body, out),
+        2 => lang_ts::parse_methods_into(&file.source, &file.path, line_range, body, out),
         _ => {
             for m in lang.parse_methods(&file.source, &file.path) {
+                if let Some((min_ln, max_ln)) = line_range
+                    && (m.end_line < min_ln || m.start_line > max_ln)
+                {
+                    continue;
+                }
                 let root = body.push_node(&m.body);
                 out.push(FastMethod {
                     name: m.name,
@@ -486,13 +492,13 @@ fn build_index_single(
             stats.unsupported_files += 1;
             continue;
         };
-        if utf16_len(&file.source) > max_file_length {
+        if utf16_len_exceeds(&file.source, max_file_length) {
             stats.oversized_files += 1;
             continue;
         }
         stats.files += 1;
         let lang = &*languages[li];
-        parse_file_into_body(lang, file, &mut scratch.body, &mut scratch.methods);
+        parse_file_into_body(lang, file, None, &mut scratch.body, &mut scratch.methods);
         if scratch.methods.is_empty() {
             continue;
         }
@@ -926,7 +932,7 @@ fn build_index_parallel(
             stats.unsupported_files += 1;
             continue;
         };
-        if utf16_len(&file.source) > max_file_length {
+        if utf16_len_exceeds(&file.source, max_file_length) {
             stats.oversized_files += 1;
             continue;
         }
@@ -1002,7 +1008,7 @@ fn build_index_parallel(
                     let lang = &*languages[lang_idx as usize];
                     let base = file.source.as_bytes();
                     let ma_labels = lang.member_access_labels();
-                    parse_file_into_body(lang, file, &mut sc.body, &mut sc.methods);
+                    parse_file_into_body(lang, file, None, &mut sc.body, &mut sc.methods);
 
                     for m in &sc.methods {
                         let digest = sc.body.digest(base, m.body_root);
@@ -1506,24 +1512,38 @@ pub fn query_from_snippet(
 }
 
 pub fn queries_from_lines(index: &AromaIndex, file: &SourceFile, lines: &[u32]) -> Vec<Query> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
     let Some(lang_idx) = language_index_for_path(&index.languages, &file.path) else {
         return Vec::new();
     };
     let lang = &*index.languages[lang_idx];
     let ma_labels = lang.member_access_labels();
-    let wanted: FxHashSet<u32> = lines.iter().copied().collect();
-    if wanted.is_empty() {
-        return Vec::new();
+
+    let mut min_ln = u32::MAX;
+    let mut max_ln = 0u32;
+    for &ln in lines {
+        min_ln = min_ln.min(ln);
+        max_ln = max_ln.max(ln);
     }
+    let wanted_set: Option<FxHashSet<u32>> = if lines.len() > 16 {
+        Some(lines.iter().copied().collect())
+    } else {
+        None
+    };
     let base = file.source.as_bytes();
 
     TL_SCRATCH.with(|cell| {
         let mut sc = cell.borrow_mut();
         let sc = &mut *sc;
-        parse_file_into_body(lang, file, &mut sc.body, &mut sc.methods);
+        parse_file_into_body(lang, file, Some((min_ln, max_ln)), &mut sc.body, &mut sc.methods);
         let mut queries = Vec::new();
 
         for m in &sc.methods {
+            if m.end_line < min_ln || m.start_line > max_ln {
+                continue;
+            }
             sc.hashes.clear();
             sc.offsets.clear();
             sc.tok_lines.clear();
@@ -1532,11 +1552,23 @@ pub fn queries_from_lines(index: &AromaIndex, file: &SourceFile, lines: &[u32]) 
             let mut covered: Vec<u32> = Vec::new();
 
             let mut pred = |line: u32, end_line: u32| -> bool {
+                if end_line < min_ln || line > max_ln {
+                    return false;
+                }
                 let mut sel = false;
-                for ln in line..=end_line {
-                    if wanted.contains(&ln) {
-                        covered.push(ln);
-                        sel = true;
+                if let Some(ref set) = wanted_set {
+                    for ln in line..=end_line {
+                        if set.contains(&ln) {
+                            covered.push(ln);
+                            sel = true;
+                        }
+                    }
+                } else {
+                    for ln in line..=end_line {
+                        if lines.contains(&ln) {
+                            covered.push(ln);
+                            sel = true;
+                        }
                     }
                 }
                 sel

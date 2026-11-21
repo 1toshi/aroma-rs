@@ -1,51 +1,45 @@
 //! TypeScript / JavaScript / JSX / TSX language front-end, matching
 //! `ref-ts/src/languages/typescript.ts`.
+//! Shares `TL_FRONT` scratch with Python front-end, uses packed single-byte
+//! `kind` + `named_kind` tables, and zero-alloc `NameSet`.
 
-use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use rustc_hash::FxHashSet;
-
-use crate::lang_py::FastMethod;
+use crate::lang_py::{FastMethod, FrontScratch, TL_FRONT};
 use crate::lezer::{self, Grammar, SyntaxTree, NONE};
 use crate::simple::{Body, Cfg, Simplifier};
-use crate::text::{js_ws, Src};
+use crate::text::{js_ws, NameSet, Src};
 use crate::{Language, Node, ParsedMethod, SnippetOptions};
 
-thread_local! {
-    static TL_TS_TREE: RefCell<SyntaxTree> = RefCell::new(SyntaxTree::default());
+pub(crate) fn shrink_tl_tree() {
+    crate::lang_py::shrink_tl_tree();
 }
 
-pub(crate) fn shrink_tl_tree() {
-    TL_TS_TREE.with(|cell| {
-        let mut t = cell.borrow_mut();
-        t.nodes.clear();
-        t.nodes.shrink_to_fit();
-    });
-}
+// Single-byte node kinds (0 = irrelevant)
+const K_NONE: u8 = 0;
+const K_VAR_NAME: u8 = 1;
+const K_VAR_DEF: u8 = 2;
+const K_PROP_DEF: u8 = 3;
+const K_PRIV_PROP_DEF: u8 = 4;
+const K_FUNC_NON_ARROW: u8 = 5; // FunctionDeclaration, FunctionExpression, MethodDeclaration
+const K_ARROW: u8 = 6;
+const K_PROPERTY: u8 = 7;
+const K_PARAM_LIST: u8 = 8;
+const K_BLOCK: u8 = 9;
+const K_IMPORT_DECL: u8 = 10;
+const K_CALL_EXPR: u8 = 11;
+const K_NEW_EXPR: u8 = 12;
+const K_KW_NEW: u8 = 13;
 
 const NAMED_NONE: u8 = 0;
-const NAMED_VAR_DEF: u8 = 1; // FunctionDeclaration, FunctionExpression, ClassDeclaration, ClassExpression, VariableDeclaration
-const NAMED_PROP_OR_PRIV: u8 = 2; // MethodDeclaration, PropertyDeclaration
-const NAMED_PROP_ONLY: u8 = 3; // Property
+const NAMED_VAR_DEF: u8 = 1;
+const NAMED_PROP_OR_PRIV: u8 = 2;
+const NAMED_PROP_ONLY: u8 = 3;
 
 struct TsTables {
     cfg: Cfg,
-    is_var: Vec<bool>,
-    is_var_def: Vec<bool>,
-    is_prop_def: Vec<bool>,
-    is_priv_prop_def: Vec<bool>,
-    is_function: Vec<bool>,
-    is_property: Vec<bool>,
-    is_param_list: Vec<bool>,
-    is_block: Vec<bool>,
-    is_arrow: Vec<bool>,
-    is_import_decl: Vec<bool>,
-    is_call_expr: Vec<bool>,
-    is_new_expr: Vec<bool>,
-    is_kw_new: Vec<bool>,
+    kind: Vec<u8>,
     named_kind: Vec<u8>,
 }
 
@@ -53,7 +47,25 @@ fn tables() -> &'static TsTables {
     static T: OnceLock<TsTables> = OnceLock::new();
     T.get_or_init(|| {
         let nn = lezer::TS.node_names;
-        let flags = |set: &[&str]| nn.iter().map(|n| set.contains(n)).collect::<Vec<bool>>();
+        let kind = nn
+            .iter()
+            .map(|&n| match n {
+                "VariableName" => K_VAR_NAME,
+                "VariableDefinition" => K_VAR_DEF,
+                "PropertyDefinition" => K_PROP_DEF,
+                "PrivatePropertyDefinition" => K_PRIV_PROP_DEF,
+                "FunctionDeclaration" | "FunctionExpression" | "MethodDeclaration" => K_FUNC_NON_ARROW,
+                "ArrowFunction" => K_ARROW,
+                "Property" => K_PROPERTY,
+                "ParamList" => K_PARAM_LIST,
+                "Block" => K_BLOCK,
+                "ImportDeclaration" => K_IMPORT_DECL,
+                "CallExpression" => K_CALL_EXPR,
+                "NewExpression" => K_NEW_EXPR,
+                "new" => K_KW_NEW,
+                _ => K_NONE,
+            })
+            .collect();
         let named_kind = nn
             .iter()
             .map(|&n| match n {
@@ -93,27 +105,15 @@ fn tables() -> &'static TsTables {
                 &["LineComment", "BlockComment", "Hashbang"],
                 false,
             ),
-            is_var: flags(&["VariableName", "VariableDefinition"]),
-            is_var_def: flags(&["VariableDefinition"]),
-            is_prop_def: flags(&["PropertyDefinition"]),
-            is_priv_prop_def: flags(&["PrivatePropertyDefinition"]),
-            is_function: flags(&[
-                "FunctionDeclaration",
-                "FunctionExpression",
-                "ArrowFunction",
-                "MethodDeclaration",
-            ]),
-            is_property: flags(&["Property"]),
-            is_param_list: flags(&["ParamList"]),
-            is_block: flags(&["Block"]),
-            is_arrow: flags(&["ArrowFunction"]),
-            is_import_decl: flags(&["ImportDeclaration"]),
-            is_call_expr: flags(&["CallExpression"]),
-            is_new_expr: flags(&["NewExpression"]),
-            is_kw_new: flags(&["new"]),
+            kind,
             named_kind,
         }
     })
+}
+
+#[inline(always)]
+fn kind_of(t: &TsTables, tree: &SyntaxTree, n: u32) -> u8 {
+    unsafe { *t.kind.get_unchecked(tree.ty(n) as usize) }
 }
 
 #[inline]
@@ -126,15 +126,6 @@ fn grammar_for(path: Option<&str>) -> &'static Grammar {
     }
 }
 
-#[inline]
-fn node_text<'a>(src: &Src<'a>, tree: &SyntaxTree, n: u32) -> Cow<'a, str> {
-    let (a, b) = (tree.from(n), tree.to(n));
-    match src.str_range(a, b) {
-        Some(s) => Cow::Borrowed(s),
-        None => Cow::Owned(src.string(a, b)),
-    }
-}
-
 fn line_span(src: &Src<'_>, from: u32, to: u32) -> (u32, u32) {
     let mut end = to;
     while end > from + 1 && js_ws(src.unit(end - 1)) {
@@ -144,27 +135,42 @@ fn line_span(src: &Src<'_>, from: u32, to: u32) -> (u32, u32) {
 }
 
 #[inline]
-fn looks_global(word: &str, globals: Option<&HashSet<String>>) -> bool {
-    word.as_bytes().first().is_some_and(|b| b.is_ascii_uppercase())
-        || globals.is_some_and(|g| g.contains(word))
+fn looks_global(src: &Src<'_>, from: u32, to: u32, globals: Option<&HashSet<String>>) -> bool {
+    if from < to {
+        let first = src.unit(from);
+        if (b'A' as u32..=b'Z' as u32).contains(&first) {
+            return true;
+        }
+    }
+    if let Some(g) = globals {
+        match src.str_range(from, to) {
+            Some(s) => g.contains(s),
+            None => g.contains(&src.string(from, to)),
+        }
+    } else {
+        false
+    }
 }
 
-#[inline]
-fn is_function(t: &TsTables, tree: &SyntaxTree, n: u32) -> bool {
-    let ty = tree.ty(n) as usize;
-    if t.is_function[ty] {
-        return true;
+#[inline(always)]
+fn is_function(t: &TsTables, tree: &SyntaxTree, n: u32) -> (bool, bool) {
+    let k = kind_of(t, tree, n);
+    if k == K_FUNC_NON_ARROW {
+        return (true, false);
     }
-    if t.is_property[ty] {
+    if k == K_ARROW {
+        return (true, true);
+    }
+    if k == K_PROPERTY {
         let mut c = tree.first_child(n);
         while c != NONE {
-            if t.is_param_list[tree.ty(c) as usize] {
-                return true;
+            if kind_of(t, tree, c) == K_PARAM_LIST {
+                return (true, false);
             }
             c = tree.next_sibling(c);
         }
     }
-    false
+    (false, false)
 }
 
 #[inline]
@@ -173,29 +179,28 @@ fn is_callee(t: &TsTables, tree: &SyntaxTree, n: u32) -> bool {
     if p == NONE {
         return false;
     }
-    let pty = tree.ty(p) as usize;
-    if t.is_call_expr[pty] && tree.first_child(p) == n {
-        return true;
-    }
-    if t.is_new_expr[pty] {
-        let mut prev = NONE;
-        let mut c = tree.first_child(p);
-        while c != NONE && c != n {
-            prev = c;
-            c = tree.next_sibling(c);
+    match kind_of(t, tree, p) {
+        K_CALL_EXPR => tree.first_child(p) == n,
+        K_NEW_EXPR => {
+            let mut prev = NONE;
+            let mut c = tree.first_child(p);
+            while c != NONE && c != n {
+                prev = c;
+                c = tree.next_sibling(c);
+            }
+            prev != NONE && kind_of(t, tree, prev) == K_KW_NEW
         }
-        return prev != NONE && t.is_kw_new[tree.ty(prev) as usize];
+        _ => false,
     }
-    false
 }
 
-fn names_under<'a>(
+fn names_under(
     t: &TsTables,
-    src: &Src<'a>,
+    src: &Src<'_>,
     tree: &SyntaxTree,
     root: u32,
-    declared: &mut FxHashSet<Cow<'a, str>>,
-    imported: &mut FxHashSet<Cow<'a, str>>,
+    declared: &mut NameSet,
+    imported: &mut NameSet,
 ) {
     declared.clear();
     imported.clear();
@@ -206,23 +211,22 @@ fn names_under<'a>(
     let mut cur = first;
     let mut depth = 1u32;
     loop {
-        if t.is_var_def[tree.ty(cur) as usize] {
+        if kind_of(t, tree, cur) == K_VAR_DEF {
             let p = tree.parent(cur);
             let is_import = if p != NONE {
-                if t.is_import_decl[tree.ty(p) as usize] {
+                if kind_of(t, tree, p) == K_IMPORT_DECL {
                     true
                 } else {
                     let gp = tree.parent(p);
-                    gp != NONE && t.is_import_decl[tree.ty(gp) as usize]
+                    gp != NONE && kind_of(t, tree, gp) == K_IMPORT_DECL
                 }
             } else {
                 false
             };
-            let w = node_text(src, tree, cur);
             if is_import {
-                imported.insert(w);
+                imported.insert(src, tree.from(cur), tree.to(cur));
             } else {
-                declared.insert(w);
+                declared.insert(src, tree.from(cur), tree.to(cur));
             }
         }
         let fc = tree.first_child(cur);
@@ -246,26 +250,39 @@ fn names_under<'a>(
     }
 }
 
-fn name_of(t: &TsTables, src: &Src<'_>, tree: &SyntaxTree, node: u32) -> String {
-    let mut parts: Vec<Cow<'_, str>> = Vec::new();
+#[inline]
+fn push_src_span(src: &Src<'_>, span: (u32, u32), out: &mut String) {
+    match src.str_range(span.0, span.1) {
+        Some(s) => out.push_str(s),
+        None => out.push_str(&src.string(span.0, span.1)),
+    }
+}
+
+fn name_of(
+    t: &TsTables,
+    src: &Src<'_>,
+    tree: &SyntaxTree,
+    node: u32,
+    parts: &mut Vec<(u32, u32)>,
+) -> String {
+    parts.clear();
     let mut inner = NONE;
     let mut at = node;
     while at != NONE {
-        let nk = t.named_kind[tree.ty(at) as usize];
+        let nk = unsafe { *t.named_kind.get_unchecked(tree.ty(at) as usize) };
         if nk != NAMED_NONE {
             let from = if inner == NONE { u32::MAX } else { tree.from(inner) };
-            // Find last matching child with child.to <= from
             let mut last_match = NONE;
             let mut c = tree.first_child(at);
             while c != NONE {
                 if tree.to(c) > from {
                     break;
                 }
-                let cty = tree.ty(c) as usize;
+                let ck = kind_of(t, tree, c);
                 let matches = match nk {
-                    NAMED_VAR_DEF => t.is_var_def[cty],
-                    NAMED_PROP_OR_PRIV => t.is_prop_def[cty] || t.is_priv_prop_def[cty],
-                    NAMED_PROP_ONLY => t.is_prop_def[cty],
+                    NAMED_VAR_DEF => ck == K_VAR_DEF,
+                    NAMED_PROP_OR_PRIV => ck == K_PROP_DEF || ck == K_PRIV_PROP_DEF,
+                    NAMED_PROP_ONLY => ck == K_PROP_DEF,
                     _ => false,
                 };
                 if matches {
@@ -274,7 +291,7 @@ fn name_of(t: &TsTables, src: &Src<'_>, tree: &SyntaxTree, node: u32) -> String 
                 c = tree.next_sibling(c);
             }
             if last_match != NONE {
-                parts.push(node_text(src, tree, last_match));
+                parts.push((tree.from(last_match), tree.to(last_match)));
             }
         }
         inner = at;
@@ -284,14 +301,18 @@ fn name_of(t: &TsTables, src: &Src<'_>, tree: &SyntaxTree, node: u32) -> String 
         return "<anonymous>".to_string();
     }
     if parts.len() == 1 {
-        return parts.pop().unwrap().into_owned();
+        let p = parts[0];
+        return match src.str_range(p.0, p.1) {
+            Some(s) => s.to_string(),
+            None => src.string(p.0, p.1),
+        };
     }
     let mut out = String::new();
-    for (i, p) in parts.iter().rev().enumerate() {
+    for (i, &p) in parts.iter().rev().enumerate() {
         if i > 0 {
             out.push('.');
         }
-        out.push_str(p);
+        push_src_span(src, p, &mut out);
     }
     out
 }
@@ -299,63 +320,78 @@ fn name_of(t: &TsTables, src: &Src<'_>, tree: &SyntaxTree, node: u32) -> String 
 pub(crate) fn parse_methods_into(
     source: &str,
     path: &str,
+    line_range: Option<(u32, u32)>,
     body: &mut Body,
     out: &mut Vec<FastMethod>,
 ) {
     let t = tables();
-    let src = Src::new(source);
-    TL_TS_TREE.with(|cell| {
-        let mut tree = cell.borrow_mut();
-        src.parse_into(grammar_for(Some(path)), &mut tree);
-        let mut declared: FxHashSet<Cow<'_, str>> = FxHashSet::default();
-        let mut imported: FxHashSet<Cow<'_, str>> = FxHashSet::default();
+    TL_FRONT.with(|cell| {
+        let mut sc = cell.borrow_mut();
+        let FrontScratch { tree, src_buf, set_a, set_b, classes } = &mut *sc;
+        let src = Src::build(source, src_buf);
+        src.parse_into(grammar_for(Some(path)), tree);
 
         #[allow(clippy::too_many_arguments)]
-        fn walk<'a>(
+        fn walk(
             t: &TsTables,
-            src: &Src<'a>,
+            src: &Src<'_>,
             tree: &SyntaxTree,
             n: u32,
-            declared: &mut FxHashSet<Cow<'a, str>>,
-            imported: &mut FxHashSet<Cow<'a, str>>,
+            line_range: Option<(u32, u32)>,
+            parts: &mut Vec<(u32, u32)>,
+            declared: &mut NameSet,
+            imported: &mut NameSet,
             body: &mut Body,
             out: &mut Vec<FastMethod>,
         ) {
-            if is_function(t, tree, n) {
+            let (is_fn, is_arrow) = is_function(t, tree, n);
+            if is_fn {
                 let b = tree.last_child(n);
-                if b == NONE || (!t.is_block[tree.ty(b) as usize] && !t.is_arrow[tree.ty(n) as usize]) {
+                if b == NONE || (!is_arrow && kind_of(t, tree, b) != K_BLOCK) {
                     return;
                 }
+                let (start_line, end_line) = if let Some((min_ln, max_ln)) = line_range {
+                    let (sl, el) = line_span(src, tree.from(n), tree.to(n));
+                    if el < min_ln || sl > max_ln {
+                        return;
+                    }
+                    (sl, el)
+                } else {
+                    (0, 0)
+                };
                 names_under(t, src, tree, n, declared, imported);
                 let simp = Simplifier {
                     src,
                     tree,
                     cfg: &t.cfg,
                     is_local: |node| {
-                        !declared.is_empty()
-                            && t.is_var[tree.ty(node) as usize]
-                            && declared.contains(&node_text(src, tree, node))
+                        if declared.is_empty() {
+                            return false;
+                        }
+                        let k = kind_of(t, tree, node);
+                        (k == K_VAR_NAME || k == K_VAR_DEF)
+                            && declared.contains(src, tree.from(node), tree.to(node))
                     },
                 };
                 if let Some(root) = simp.run(body, b) {
-                    let name = name_of(t, src, tree, n);
-                    let (start_line, end_line) = line_span(src, tree.from(n), tree.to(n));
-                    out.push(FastMethod { name, start_line, end_line, body_root: root });
+                    let name = name_of(t, src, tree, n, parts);
+                    let (sl, el) = if line_range.is_some() {
+                        (start_line, end_line)
+                    } else {
+                        line_span(src, tree.from(n), tree.to(n))
+                    };
+                    out.push(FastMethod { name, start_line: sl, end_line: el, body_root: root });
                 }
                 return;
             }
             let mut c = tree.first_child(n);
             while c != NONE {
-                walk(t, src, tree, c, declared, imported, body, out);
+                walk(t, src, tree, c, line_range, parts, declared, imported, body, out);
                 c = tree.next_sibling(c);
             }
         }
 
-        walk(t, &src, &tree, 0, &mut declared, &mut imported, body, out);
-        if tree.nodes.capacity() > 32768 {
-            tree.nodes.clear();
-            tree.nodes.shrink_to(8192);
-        }
+        walk(t, &src, tree, 0, line_range, classes, set_a, set_b, body, out);
     });
 }
 
@@ -365,27 +401,31 @@ pub(crate) fn parse_snippet_into(
     body: &mut Body,
 ) -> Option<u32> {
     let t = tables();
-    let src = Src::new(source);
-    TL_TS_TREE.with(|cell| {
-        let mut tree = cell.borrow_mut();
-        src.parse_into(grammar_for(options.path.as_deref()), &mut tree);
-        let mut declared: FxHashSet<Cow<'_, str>> = FxHashSet::default();
-        let mut imported: FxHashSet<Cow<'_, str>> = FxHashSet::default();
-        names_under(t, &src, &tree, 0, &mut declared, &mut imported);
+    TL_FRONT.with(|cell| {
+        let mut sc = cell.borrow_mut();
+        let FrontScratch { tree, src_buf, set_a, set_b, .. } = &mut *sc;
+        let src = Src::build(source, src_buf);
+        src.parse_into(grammar_for(options.path.as_deref()), tree);
+        names_under(t, &src, tree, 0, set_a, set_b);
+        let declared = &*set_a;
+        let imported = &*set_b;
         let globals = options.globals.as_ref();
         let simp = Simplifier {
             src: &src,
-            tree: &tree,
+            tree,
             cfg: &t.cfg,
             is_local: |node| {
-                if !t.is_var[tree.ty(node) as usize] {
+                let k = kind_of(t, tree, node);
+                if k != K_VAR_NAME && k != K_VAR_DEF {
                     return false;
                 }
-                let word = node_text(&src, &tree, node);
-                if declared.contains(&word) {
+                let (a, b) = (tree.from(node), tree.to(node));
+                if declared.contains(&src, a, b) {
                     return true;
                 }
-                !(imported.contains(&word) || looks_global(&word, globals) || is_callee(t, &tree, node))
+                !(imported.contains(&src, a, b)
+                    || looks_global(&src, a, b, globals)
+                    || is_callee(t, tree, node))
             },
         };
         simp.run(body, 0)
@@ -410,7 +450,7 @@ impl Language for TypeScriptLanguage {
     fn parse_methods(&self, source: &str, path: &str) -> Vec<ParsedMethod> {
         let mut body = Body::default();
         let mut raw = Vec::new();
-        parse_methods_into(source, path, &mut body, &mut raw);
+        parse_methods_into(source, path, None, &mut body, &mut raw);
         let base = source.as_bytes();
         raw.into_iter()
             .map(|m| ParsedMethod {
