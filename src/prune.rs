@@ -354,16 +354,17 @@ fn compute_gain_sorted(hits: &[u32], has_dup: bool, rem: &[u32]) -> usize {
 }
 
 #[inline]
-fn run_greedy_buckets(
+fn run_greedy_buckets_into(
     max_gain: usize,
     expected_score: Option<usize>,
     initial_sorted: bool,
     scratch: &mut PruneScratch,
-) -> Pruned {
+    kept: &mut Vec<usize>,
+) -> usize {
+    kept.clear();
     if max_gain == 0 {
-        return Pruned { tokens: Vec::new(), score: 0 };
+        return 0;
     }
-    let mut kept: Vec<usize> = Vec::new();
     let mut score = 0usize;
     let mut dirty_mask: u64 = if initial_sorted { 0 } else { u64::MAX };
 
@@ -443,19 +444,20 @@ fn run_greedy_buckets(
     }
 
     kept.sort_unstable();
-    Pruned { tokens: kept, score }
+    score
 }
 
 #[inline]
-fn run_greedy_sig(
+fn run_greedy_sig_into(
     max_gain: usize,
     expected_score: Option<usize>,
     scratch: &mut PruneScratch,
-) -> Pruned {
+    kept: &mut Vec<usize>,
+) -> usize {
+    kept.clear();
     if max_gain == 0 {
-        return Pruned { tokens: Vec::new(), score: 0 };
+        return 0;
     }
-    let mut kept: Vec<usize> = Vec::new();
     let mut score = 0usize;
 
     'outer: for val in (1..=max_gain).rev() {
@@ -597,7 +599,7 @@ fn run_greedy_sig(
     }
 
     kept.sort_unstable();
-    Pruned { tokens: kept, score }
+    score
 }
 
 const SIG_THRESHOLD: usize = 512;
@@ -612,13 +614,48 @@ pub(crate) fn prune_with_fast_map(
     candidates: Option<&[usize]>,
     scratch: &mut PruneScratch,
 ) -> Pruned {
+    let mut tokens = Vec::new();
+    let score = prune_with_fast_map_into(
+        qmap,
+        all_features,
+        offsets,
+        feat_base,
+        expected_score,
+        candidates,
+        scratch,
+        &mut tokens,
+    );
+    Pruned { tokens, score }
+}
+
+/// Reusable-buffer version of `prune_with_fast_map` eliminating `kept` allocations.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prune_with_fast_map_into(
+    qmap: &FastQueryMap,
+    all_features: &[u32],
+    offsets: &[u32],
+    feat_base: usize,
+    expected_score: Option<usize>,
+    candidates: Option<&[usize]>,
+    scratch: &mut PruneScratch,
+    kept: &mut Vec<usize>,
+) -> usize {
     let q_len = qmap.caps.len();
     if expected_score == Some(0) || q_len == 0 || offsets.len() < 2 {
-        return Pruned { tokens: Vec::new(), score: 0 };
+        kept.clear();
+        return 0;
     }
     let tok_count = offsets.len() - 1;
     if candidates.is_none() && tok_count >= SIG_THRESHOLD {
-        return prune_with_fast_map_sig(qmap, all_features, offsets, feat_base, expected_score, scratch);
+        return prune_with_fast_map_sig_into(
+            qmap,
+            all_features,
+            offsets,
+            feat_base,
+            expected_score,
+            scratch,
+            kept,
+        );
     }
 
     scratch.rem.clear();
@@ -781,24 +818,26 @@ pub(crate) fn prune_with_fast_map(
         for b in &mut scratch.buckets[1..=max_gain] {
             b.clear();
         }
-        let mut tokens: Vec<usize> = scratch.tok_hits.iter().map(|th| th.token as usize).collect();
+        kept.clear();
+        kept.extend(scratch.tok_hits.iter().map(|th| th.token as usize));
         if !ascending {
-            tokens.sort_unstable();
+            kept.sort_unstable();
         }
-        return Pruned { tokens, score: total_gain };
+        return total_gain;
     }
 
-    run_greedy_buckets(max_gain, expected_score, ascending, scratch)
+    run_greedy_buckets_into(max_gain, expected_score, ascending, scratch, kept)
 }
 
-fn prune_with_fast_map_sig(
+fn prune_with_fast_map_sig_into(
     qmap: &FastQueryMap,
     all_features: &[u32],
     offsets: &[u32],
     feat_base: usize,
     expected_score: Option<usize>,
     scratch: &mut PruneScratch,
-) -> Pruned {
+    kept: &mut Vec<usize>,
+) -> usize {
     let q_len = qmap.caps.len();
     scratch.rem.clear();
     scratch.rem.extend_from_slice(&qmap.caps);
@@ -1241,7 +1280,7 @@ fn prune_with_fast_map_sig(
         }
     }
 
-    run_greedy_sig(max_gain, expected_score, scratch)
+    run_greedy_sig_into(max_gain, expected_score, scratch, kept)
 }
 
 /// Algorithm 1 using `PruneTarget` (public `prune`, `recommend::intersect`, fallback).
@@ -1254,9 +1293,36 @@ pub(crate) fn prune_fast(
     candidates: Option<&[usize]>,
     scratch: &mut PruneScratch,
 ) -> Pruned {
+    let mut tokens = Vec::new();
+    let score = prune_fast_into(
+        target,
+        all_features,
+        offsets,
+        feat_base,
+        expected_score,
+        candidates,
+        scratch,
+        &mut tokens,
+    );
+    Pruned { tokens, score }
+}
+
+/// Reusable-buffer version of `prune_fast` eliminating `kept` allocations.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prune_fast_into(
+    target: &PruneTarget,
+    all_features: &[u32],
+    offsets: &[u32],
+    feat_base: usize,
+    expected_score: Option<usize>,
+    candidates: Option<&[usize]>,
+    scratch: &mut PruneScratch,
+    kept: &mut Vec<usize>,
+) -> usize {
     let q_len = target.caps.len();
     if expected_score == Some(0) || q_len == 0 || offsets.len() < 2 {
-        return Pruned { tokens: Vec::new(), score: 0 };
+        kept.clear();
+        return 0;
     }
 
     scratch.rem.clear();
@@ -1333,5 +1399,5 @@ pub(crate) fn prune_fast(
         }
     }
 
-    run_greedy_buckets(max_gain, expected_score, ascending, scratch)
+    run_greedy_buckets_into(max_gain, expected_score, ascending, scratch, kept)
 }

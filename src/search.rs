@@ -16,7 +16,8 @@ use crate::index::{
     AromaIndex, LanguageIndex, MethodLocation, Query, COUNT_OVERFLOW, COUNT_SHIFT, MID_MASK,
 };
 use crate::prune::{
-    prune_fast, prune_with_fast_map, FastQueryMap, PruneScratch, PruneTarget, Pruned,
+    prune_fast, prune_fast_into, prune_with_fast_map, prune_with_fast_map_into, FastQueryMap,
+    PruneScratch, PruneTarget, Pruned,
 };
 use crate::MethodRef;
 
@@ -73,6 +74,7 @@ pub(crate) struct SearchScratch {
     pub fast_qmap: FastQueryMap,
     pub prune_target: PruneTarget,
     pub prune_scratch: PruneScratch,
+    kept_buf: Vec<usize>,
     pub rec_tmp_sort: Vec<u32>,
     pub rec_sum_pairs: Vec<(u32, u32)>,
     pub rec_shared: Vec<(u32, u32)>,
@@ -86,7 +88,8 @@ pub(crate) struct SearchScratch {
 
 thread_local! {
     pub(crate) static TL_SEARCH: RefCell<SearchScratch> = RefCell::new(SearchScratch::default());
-    static TL_PAR_PRUNE: RefCell<PruneScratch> = RefCell::new(PruneScratch::default());
+    static TL_PAR_PRUNE: RefCell<(PruneScratch, Vec<usize>)> =
+        RefCell::new((PruneScratch::default(), Vec::new()));
 }
 
 #[inline]
@@ -539,32 +542,34 @@ pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) ->
                     .par_iter()
                     .map(|cand| {
                         TL_PAR_PRUNE.with(|pcell| {
-                            let mut ps = pcell.borrow_mut();
+                            let (ps, kept) = &mut *pcell.borrow_mut();
                             let m = &lidx.methods[cand.mid as usize];
                             let offsets = lidx.method_offsets(cand.mid as usize);
-                            let pruned = if use_fast {
-                                prune_with_fast_map(
+                            let score = if use_fast {
+                                prune_with_fast_map_into(
                                     qmap,
                                     &lidx.all_features,
                                     offsets,
                                     m.feat_start as usize,
                                     Some(cand.score as usize),
                                     None,
-                                    &mut ps,
+                                    ps,
+                                    kept,
                                 )
                             } else {
-                                prune_fast(
+                                prune_fast_into(
                                     ptarget,
                                     &lidx.all_features,
                                     offsets,
                                     m.feat_start as usize,
                                     Some(cand.score as usize),
                                     None,
-                                    &mut ps,
+                                    ps,
+                                    kept,
                                 )
                             };
-                            debug_assert_eq!(pruned.score, cand.score as usize);
-                            let matched_lines = matched_lines_of(lidx, cand.loc, &pruned.tokens);
+                            debug_assert_eq!(score, cand.score as usize);
+                            let matched_lines = matched_lines_of(lidx, cand.loc, kept);
                             SearchResult {
                                 method: index.make_ref(lidx, cand.loc),
                                 similarity: cand.score as f64 / qsize,
@@ -579,8 +584,8 @@ pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) ->
             for cand in survivors {
                 let m = &lidx.methods[cand.mid as usize];
                 let offsets = lidx.method_offsets(cand.mid as usize);
-                let pruned = if use_fast {
-                    prune_with_fast_map(
+                let score = if use_fast {
+                    prune_with_fast_map_into(
                         qmap,
                         &lidx.all_features,
                         offsets,
@@ -588,9 +593,10 @@ pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) ->
                         Some(cand.score as usize),
                         None,
                         &mut sc.prune_scratch,
+                        &mut sc.kept_buf,
                     )
                 } else {
-                    prune_fast(
+                    prune_fast_into(
                         ptarget,
                         &lidx.all_features,
                         offsets,
@@ -598,10 +604,11 @@ pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) ->
                         Some(cand.score as usize),
                         None,
                         &mut sc.prune_scratch,
+                        &mut sc.kept_buf,
                     )
                 };
-                debug_assert_eq!(pruned.score, cand.score as usize);
-                let matched_lines = matched_lines_of(lidx, cand.loc, &pruned.tokens);
+                debug_assert_eq!(score, cand.score as usize);
+                let matched_lines = matched_lines_of(lidx, cand.loc, &sc.kept_buf);
                 out.push(SearchResult {
                     method: index.make_ref(lidx, cand.loc),
                     similarity: cand.score as f64 / qsize,
@@ -665,7 +672,7 @@ pub(crate) fn rank_for_recommend<'a>(
                 .par_iter()
                 .map(|cand| {
                     TL_PAR_PRUNE.with(|pcell| {
-                        let mut ps = pcell.borrow_mut();
+                        let (ps, _) = &mut *pcell.borrow_mut();
                         let m = &lidx.methods[cand.mid as usize];
                         let offsets = lidx.method_offsets(cand.mid as usize);
                         let pruned = if use_fast {
@@ -676,7 +683,7 @@ pub(crate) fn rank_for_recommend<'a>(
                                 m.feat_start as usize,
                                 Some(cand.score as usize),
                                 None,
-                                &mut ps,
+                                ps,
                             )
                         } else {
                             prune_fast(
@@ -686,7 +693,7 @@ pub(crate) fn rank_for_recommend<'a>(
                                 m.feat_start as usize,
                                 Some(cand.score as usize),
                                 None,
-                                &mut ps,
+                                ps,
                             )
                         };
                         debug_assert_eq!(pruned.score, cand.score as usize);
