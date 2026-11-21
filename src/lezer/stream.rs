@@ -1,7 +1,7 @@
 //! The input stream tokenizers read from (`InputStream` in @lezer/lr) and the
 //! precomputed L1-resident `u8`-indexed ASCII DFA tokenizer (`readToken`) with
-//! per-dialect `(group, row)` O(1) accept table, O(1) precedence ranking, and
-//! tight self-loop unrolling.
+//! per-dialect `(group, row)` O(1) accept + sink-state bit, state-0 peeling,
+//! O(1) precedence ranking, and tight self-loop unrolling.
 
 use super::{Grammar, Tok};
 
@@ -203,13 +203,18 @@ fn overrides(token: i32, prev: i32, table: &[u16], offset: usize) -> bool {
 }
 
 // ============================================================================
-// Precomputed L1-resident `u8`-indexed ASCII DFA + per-dialect accept table
+// Precomputed L1-resident `u8`-indexed ASCII DFA + per-dialect accept/sink table
 // ============================================================================
 
 const NO_EDGE: u8 = u8::MAX;
 const STOP_ACC: u16 = 0xFFFF;
 const NO_ACC: u16 = 0xFFFE;
 const MULTI_ACC: u16 = 0xFFFD;
+/// Set on single-accept entries in `acc_by_group` when the DFA state has zero
+/// outgoing edges (no ASCII edges, no hi_edges, no EOF edge), allowing immediate
+/// loop exit without reading `input[pos]` or indexing `ascii[row * 128 + ch]`.
+const SINK_BIT: u16 = 0x4000;
+const TERM_MASK: u16 = 0x3FFF;
 
 #[derive(Clone, Copy)]
 pub(crate) struct DfaStateMeta {
@@ -230,7 +235,7 @@ pub(crate) struct DfaAccel {
     /// - `STOP_ACC`: `(group_mask & state.mask) == 0` (stop scanning!)
     /// - `NO_ACC`: in group, no allowed accepting token at this row
     /// - `MULTI_ACC`: in group, > 1 allowed accepting tokens (fallback to scan)
-    /// - `term`: unique allowed accepting token at `(group, row)`!
+    /// - `term | (SINK_BIT if no outgoing edges)`: unique allowed accepting token!
     pub acc_by_group: Vec<u16>,
     /// Non-ASCII edges (`>= 128`): `[from, to_u16_0_is_65536, target_row]`
     pub hi_edges: Vec<[u16; 3]>,
@@ -263,6 +268,7 @@ impl DfaAccel {
         let mut ascii = vec![NO_EDGE; n * 128];
         let mut hi_edges: Vec<[u16; 3]> = Vec::new();
         let mut masks = Vec::with_capacity(n);
+        let mut is_sink = vec![false; n];
 
         for (row, &off) in offsets.iter().enumerate() {
             let mask = data[off];
@@ -271,6 +277,7 @@ impl DfaAccel {
             let num_edges = data[off + 2] as usize;
             let mut eof_row = NO_EDGE;
             let edge_start = hi_edges.len() as u16;
+            is_sink[row] = num_edges == 0;
 
             for e in 0..num_edges {
                 let idx = acc_end + e * 3;
@@ -342,6 +349,9 @@ impl DfaAccel {
                     }
                     j += 2;
                 }
+                if found < MULTI_ACC && is_sink[row] {
+                    found |= SINK_BIT;
+                }
                 acc_by_group[base + row] = found;
             }
         }
@@ -367,6 +377,7 @@ impl DfaAccel {
 
 /// Register-resident, L1 `u8`-DFA accelerated `readToken` returning
 /// `(value, end, look_ahead)` directly in registers without mutating `Stream`.
+/// Peels state 0 on ASCII input and exits immediately on sink states (`SINK_BIT`).
 #[inline]
 pub(crate) fn read_token_group<C: Ch>(
     g: &Grammar,
@@ -386,6 +397,19 @@ pub(crate) fn read_token_group<C: Ch>(
     let mut cur = -1i32;
     let mut cur_end = -1i32;
 
+    // Peel state 0 when it is non-accepting (the universal case in Lezer DFAs)
+    if pos < end && unsafe { *acc_col.get_unchecked(0) } == NO_ACC {
+        let ch0 = unsafe { input.get_unchecked(pos).code() };
+        if C::ALWAYS_ASCII || ch0 < 128 {
+            let r1 = unsafe { *ascii.get_unchecked(ch0 as usize) };
+            if r1 == NO_EDGE {
+                return (-1, -1, start as i32 + 1);
+            }
+            row = r1 as usize;
+            pos += 1;
+        }
+    }
+
     loop {
         let acc = unsafe { *acc_col.get_unchecked(row) };
         if acc == STOP_ACC {
@@ -393,7 +417,7 @@ pub(crate) fn read_token_group<C: Ch>(
         }
         let mut accepted_here = false;
         if acc < MULTI_ACC {
-            let term = acc as i32;
+            let term = (acc & TERM_MASK) as i32;
             if cur == term {
                 cur_end = pos as i32;
                 accepted_here = true;
@@ -408,6 +432,9 @@ pub(crate) fn read_token_group<C: Ch>(
                     cur_end = pos as i32;
                     accepted_here = true;
                 }
+            }
+            if (acc & SINK_BIT) != 0 {
+                break;
             }
         } else if acc == MULTI_ACC {
             let m = unsafe { *dfa.meta.get_unchecked(row) };
@@ -483,7 +510,6 @@ pub(crate) fn read_token_group<C: Ch>(
                         pos += 1;
                         continue;
                     }
-                    // Hit EOF during self-loop: check EOF edge directly
                     let eof_row = unsafe { dfa.meta.get_unchecked(row).eof_row };
                     if eof_row != NO_EDGE {
                         row = eof_row as usize;

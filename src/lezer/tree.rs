@@ -138,7 +138,7 @@ impl Builder<'_> {
 
 pub(crate) fn build_tree_into(g: &Grammar, buffer: &[Rec], length: u32, out: &mut SyntaxTree) {
     out.nodes.clear();
-    let est = buffer.len() + 1;
+    let est = (buffer.len() / 2).max(64);
     if out.nodes.capacity() < est {
         out.nodes.reserve(est - out.nodes.capacity());
     }

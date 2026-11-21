@@ -58,6 +58,7 @@ pub struct Grammar {
     pub(crate) top_state: u32,
     pub top_term: u16,
     pub node_names: &'static [&'static str],
+    #[allow(dead_code)]
     pub(crate) dyn_prec: &'static [i32],
     pub(crate) tokenizers: &'static [Tok],
     pub(crate) locals: &'static [LocalGroup],
@@ -108,11 +109,9 @@ impl GotoTable {
             let first_tag = table[pos] as usize;
             let first_target = table[pos + 1];
             if (first_tag & 1) != 0 {
-                // Only one group -> same loose target for EVERY state!
                 single[term] = first_target;
                 continue;
             }
-            // Find the fallback (last group's target)
             let mut scan = pos;
             let default_target;
             loop {
@@ -156,13 +155,25 @@ impl GotoTable {
 
 pub(crate) const MULTI_BIT: u32 = 0x8000_0000;
 
+/// 16-byte aligned packed LR state descriptor combining `default_reduce`,
+/// `tok_mask`, pre-multiplied `act_row_off` (`u32::MAX` if `SEQ_OTHER`), and `flags`
+/// into a single cache-line-friendly load per LR step.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub(crate) struct FastState {
+    pub default_reduce: u32,
+    pub tok_mask: u32,
+    pub act_row_off: u32,
+    pub flags: u32,
+}
+
 /// Row-deduplicated `u16`-indexed action table (~8-10x smaller than raw 2D `u32`
-/// table, keeping working set comfortably inside L2 cache) plus O(1) `spec_idx`.
+/// table, keeping working set comfortably inside L2 cache) plus `FastState` and
+/// O(1) `spec_idx`.
 pub(crate) struct ActionTable {
     pub stride: usize,
-    /// `row_of_state[state]`: deduplicated row index, or `u16::MAX` if `SEQ_OTHER` present.
-    pub row_of_state: Vec<u16>,
-    /// Flat `[row * stride + term]` -> `0` (empty) or `idx` into `lut`.
+    pub fast_states: Vec<FastState>,
+    /// Flat `[act_row_off + term]` -> `0` (empty) or `idx` into `lut`.
     pub rows: Vec<u16>,
     /// `lut[0] = u32::MAX` (unused); `lut[idx]` is single action or `MULTI_BIT | off`.
     pub lut: Vec<u32>,
@@ -173,13 +184,18 @@ pub(crate) struct ActionTable {
 }
 
 impl ActionTable {
+    #[inline(always)]
+    pub fn fast_state(&self, state: u32) -> FastState {
+        unsafe { *self.fast_states.get_unchecked(state as usize) }
+    }
+
     fn build(g: &Grammar) -> Self {
         let nstates = g.states.len() / 6;
         let stride = g.max_term as usize + 1;
         let data = g.data;
 
-        let mut row_of_state = vec![u16::MAX; nstates];
-        let mut pair_to_row: FxHashMap<(u32, u32), u16> = FxHashMap::default();
+        let mut fast_states = Vec::with_capacity(nstates);
+        let mut pair_to_row: FxHashMap<(u32, u32), u32> = FxHashMap::default();
         let mut rows: Vec<u16> = Vec::new();
         let mut lut: Vec<u32> = vec![u32::MAX]; // index 0 = empty
         let mut lut_map: FxHashMap<u32, u16> = FxHashMap::default();
@@ -188,86 +204,87 @@ impl ActionTable {
 
         let mut row_entries: Vec<(u16, u32)> = Vec::with_capacity(64);
         let mut acts: Vec<u32> = Vec::with_capacity(8);
-        let mut num_rows = 0u16;
 
-        for (s, row_slot) in row_of_state.iter_mut().enumerate() {
+        for s in 0..nstates {
+            let flags = g.state_slot(s as u32, 0);
             let s1 = g.state_slot(s as u32, 1);
             let s2 = g.state_slot(s as u32, 2);
-            if let Some(&existing_row) = pair_to_row.get(&(s1, s2)) {
-                *row_slot = existing_row;
-                continue;
-            }
+            let tok_mask = g.state_slot(s as u32, 3);
+            let default_reduce = g.state_slot(s as u32, 4);
 
-            row_entries.clear();
-            let mut other = false;
-            for start in [s1, s2] {
-                let mut i = start as usize;
-                loop {
-                    let d = data[i];
-                    if d == SEQ_END {
-                        if data[i + 1] == SEQ_NEXT {
-                            i = pair(data, i + 2) as usize;
+            let act_row_off = if let Some(&existing_off) = pair_to_row.get(&(s1, s2)) {
+                existing_off
+            } else {
+                row_entries.clear();
+                let mut other = false;
+                for start in [s1, s2] {
+                    let mut i = start as usize;
+                    loop {
+                        let d = data[i];
+                        if d == SEQ_END {
+                            if data[i + 1] == SEQ_NEXT {
+                                i = pair(data, i + 2) as usize;
+                                continue;
+                            }
+                            if data[i + 1] == SEQ_OTHER {
+                                other = true;
+                            }
+                            break;
+                        }
+                        let act = pair(data, i + 1);
+                        row_entries.push((d, act));
+                        i += 3;
+                    }
+                }
+                if other {
+                    pair_to_row.insert((s1, s2), u32::MAX);
+                    u32::MAX
+                } else {
+                    let row_base = rows.len();
+                    let off_u32 = row_base as u32;
+                    pair_to_row.insert((s1, s2), off_u32);
+                    rows.resize(row_base + stride, 0u16);
+
+                    for idx in 0..row_entries.len() {
+                        let (term, act) = row_entries[idx];
+                        let t = term as usize;
+                        if t >= stride || rows[row_base + t] != 0 {
                             continue;
                         }
-                        if data[i + 1] == SEQ_OTHER {
-                            other = true;
+                        acts.clear();
+                        acts.push(act);
+                        for &(t2, a2) in &row_entries[idx + 1..] {
+                            if t2 == term && !acts.contains(&a2) {
+                                acts.push(a2);
+                            }
                         }
-                        break;
+                        let cell = if acts.len() == 1 {
+                            debug_assert_eq!(act & MULTI_BIT, 0);
+                            act
+                        } else if let Some(&off) = multi_map.get(&acts) {
+                            MULTI_BIT | off
+                        } else {
+                            let off = multi.len() as u32;
+                            multi.push(acts.len() as u32);
+                            multi.extend_from_slice(&acts);
+                            multi_map.insert(acts.clone(), off);
+                            MULTI_BIT | off
+                        };
+                        let lut_idx = if let Some(&id) = lut_map.get(&cell) {
+                            id
+                        } else {
+                            let id = lut.len() as u16;
+                            lut.push(cell);
+                            lut_map.insert(cell, id);
+                            id
+                        };
+                        rows[row_base + t] = lut_idx;
                     }
-                    let act = pair(data, i + 1);
-                    row_entries.push((d, act));
-                    i += 3;
+                    off_u32
                 }
-            }
-            if other {
-                pair_to_row.insert((s1, s2), u16::MAX);
-                *row_slot = u16::MAX;
-                continue;
-            }
+            };
 
-            let row_id = num_rows;
-            num_rows += 1;
-            pair_to_row.insert((s1, s2), row_id);
-            *row_slot = row_id;
-
-            let row_base = rows.len();
-            rows.resize(row_base + stride, 0u16);
-
-            for idx in 0..row_entries.len() {
-                let (term, act) = row_entries[idx];
-                let t = term as usize;
-                if t >= stride || rows[row_base + t] != 0 {
-                    continue;
-                }
-                acts.clear();
-                acts.push(act);
-                for &(t2, a2) in &row_entries[idx + 1..] {
-                    if t2 == term && !acts.contains(&a2) {
-                        acts.push(a2);
-                    }
-                }
-                let cell = if acts.len() == 1 {
-                    debug_assert_eq!(act & MULTI_BIT, 0);
-                    act
-                } else if let Some(&off) = multi_map.get(&acts) {
-                    MULTI_BIT | off
-                } else {
-                    let off = multi.len() as u32;
-                    multi.push(acts.len() as u32);
-                    multi.extend_from_slice(&acts);
-                    multi_map.insert(acts.clone(), off);
-                    MULTI_BIT | off
-                };
-                let lut_idx = if let Some(&id) = lut_map.get(&cell) {
-                    id
-                } else {
-                    let id = lut.len() as u16;
-                    lut.push(cell);
-                    lut_map.insert(cell, id);
-                    id
-                };
-                rows[row_base + t] = lut_idx;
-            }
+            fast_states.push(FastState { default_reduce, tok_mask, act_row_off, flags });
         }
 
         let mut spec_idx = vec![-1i8; stride];
@@ -278,7 +295,7 @@ impl ActionTable {
             }
         }
 
-        Self { stride, row_of_state, rows, lut, multi, spec_idx }
+        Self { stride, fast_states, rows, lut, multi, spec_idx }
     }
 }
 
@@ -406,16 +423,8 @@ impl Grammar {
         unsafe { *self.states.get_unchecked(state as usize * 6 + slot) }
     }
     #[inline(always)]
-    pub(crate) fn state_flag(&self, state: u32, flag: u32) -> bool {
-        (self.state_slot(state, 0) & flag) > 0
-    }
-    #[inline(always)]
     pub(crate) fn allows(&self, term: u16) -> bool {
         self.disabled.is_empty() || unsafe { *self.disabled.get_unchecked(term as usize) == 0 }
-    }
-    #[inline(always)]
-    pub(crate) fn dynamic_precedence(&self, term: u32) -> i32 {
-        self.dyn_prec.get(term as usize).copied().unwrap_or(0)
     }
     #[inline(always)]
     pub(crate) fn eof_term(&self) -> i32 {

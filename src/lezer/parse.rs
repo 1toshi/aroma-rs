@@ -1,12 +1,13 @@
 //! High-speed parse driver (`Parse` and `TokenCache` in @lezer/lr) with:
 //! - Const-generic `IS_PY` specialization eliminating runtime grammar-kind branches.
 //! - Direct inline fast-reject / fast-emit for all JS & Python external tokenizers.
-//! - Register-returning `read_token_group` (zero `Stream` mutation on DFA tokens).
-//! - Thread-local reusable `LezerWorkspace` + tight deterministic `run_fast`.
+//! - SIMD `memchr` acceleration for Python strings/docstrings and JS template strings/block comments.
+//! - Register-returning `read_token_group` + `FALLBACK_MASK` pruning + compact `MainTok`.
+//! - Arena-recycled parse stacks with inline record buffers for zero-alloc GLR splits.
 
 use std::cell::RefCell;
 
-use super::stack::{BufPool, Frame, Rec, Stack};
+use super::stack::{Rec, Stack, StackArena};
 use super::stream::{read_token_group, read_token_local, CachedToken, Ch, DfaAccel, Stream};
 use super::tree::{build_tree_into, SyntaxTree};
 use super::*;
@@ -89,7 +90,6 @@ pub(crate) struct Env<'a, 'w, C: Ch> {
     pub at: &'static ActionTable,
     pub gt: &'static GotoTable,
     pub stream: Stream<'a, C>,
-    pub bufs: &'w mut BufPool,
     pub ctxs: &'w mut Vec<PyCtx>,
     pub last_big_start: i32,
     pub last_big_size: i32,
@@ -209,7 +209,7 @@ impl<C: Ch> Env<'_, '_, C> {
             return;
         }
         let prev = s.peek(-1);
-        if (prev < 0 || is_lb(prev)) && stack.can_shift(self.g, py::BLANK_LINE_START) {
+        if (prev < 0 || is_lb(prev)) && stack.can_shift(self.g, self.at, py::BLANK_LINE_START) {
             let s = &mut self.stream;
             let mut spaces = 0;
             while s.next == 32 || s.next == 9 {
@@ -292,6 +292,80 @@ impl<C: Ch> Env<'_, '_, C> {
         let format = (flags & CX_FORMAT) > 0;
         let s = &mut self.stream;
         let start = s.pos;
+
+        // SIMD memchr fast path for ASCII non-format strings (covers ~95% of strings & all docstrings!)
+        if !format
+            && let Some(bytes) = C::as_u8_slice(s.input)
+        {
+            let q = quote as u8;
+            let end = bytes.len();
+            let start_u = start as usize;
+            let mut p = start_u;
+            while p < end {
+                match memchr::memchr3(q, b'\\', b'\n', &bytes[p..end]) {
+                    None => {
+                        p = end;
+                        break;
+                    }
+                    Some(rel) => {
+                        p += rel;
+                        let b = unsafe { *bytes.get_unchecked(p) };
+                        if b == b'\\' {
+                            if escapes {
+                                if p == start_u {
+                                    s.advance(1);
+                                    let escaped = s.next;
+                                    if escaped >= 0 {
+                                        s.advance(1);
+                                        skip_escape(s, escaped);
+                                    }
+                                    s.accept_token(py::ESCAPE, 0);
+                                    return;
+                                }
+                                break;
+                            } else if p + 1 < end {
+                                p += 2;
+                                continue;
+                            } else {
+                                p += 1;
+                                break;
+                            }
+                        } else if b == q {
+                            if !long || (p + 2 < end && bytes[p + 1] == q && bytes[p + 2] == q) {
+                                if p == start_u {
+                                    s.tok.value = py::STRING_END;
+                                    s.tok.end = (p + if long { 3 } else { 1 }) as i32;
+                                    s.tok.look_ahead = s.tok.end.min(s.end);
+                                    return;
+                                }
+                                break;
+                            }
+                            p += 1;
+                        } else {
+                            // b == b'\n'
+                            if long {
+                                p += 1;
+                                break;
+                            } else if p == start_u {
+                                s.tok.value = py::STRING_END;
+                                s.tok.end = p as i32;
+                                return;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            if p > start_u {
+                s.pos = p as i32;
+                s.next = if p < end { bytes[p] as i32 } else { -1 };
+                s.tok.value = py::STRING_CONTENT;
+                s.tok.end = p as i32;
+                s.tok.look_ahead = (p as i32 + if long { 3 } else { 1 }).min(s.end);
+            }
+            return;
+        }
+
         loop {
             if s.next < 0 {
                 break;
@@ -349,7 +423,7 @@ impl<C: Ch> Env<'_, '_, C> {
             self.stream.advance(1);
             if next == self.stream.next {
                 self.stream.advance(1);
-                let may_postfix = stack.ctx == 0 && stack.can_shift(self.g, jst::INCDEC);
+                let may_postfix = stack.ctx == 0 && stack.can_shift(self.g, self.at, jst::INCDEC);
                 self.stream.accept_token(if may_postfix { jst::INCDEC } else { jst::INCDEC_PREFIX }, 0);
             }
         } else if next == 63 && self.stream.peek(1) == 46 {
@@ -455,8 +529,10 @@ fn skip_escape<C: Ch>(s: &mut Stream<C>, ch: i32) {
 
 #[inline(always)]
 fn is_js_space(c: i32) -> bool {
-    if c < 128 {
-        matches!(c, 9 | 10 | 11 | 12 | 13 | 32)
+    if c <= 32 {
+        c == 32 || (9..=13).contains(&c)
+    } else if c < 133 {
+        false
     } else {
         matches!(c, 133 | 160 | 5760 | 8192..=8202 | 8232 | 8233 | 8239 | 8287 | 12288)
     }
@@ -472,14 +548,21 @@ fn ident_char(ch: i32, start: bool) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Token cache (inline fixed arrays, zero per-token heap/resize overhead!)
+// Token cache (inline fixed arrays + compact `MainTok`)
 // ---------------------------------------------------------------------------
 
 const INLINE_ACT_CAP: usize = 48;
 
+#[derive(Clone, Copy)]
+struct MainTok {
+    start: i32,
+    end: i32,
+    value: i32,
+}
+
 struct TokenCache {
     tokens: [CachedToken; 24],
-    main_token: Option<CachedToken>,
+    main_token: Option<MainTok>,
     actions: [i32; INLINE_ACT_CAP],
     overflow: Vec<i32>,
 }
@@ -514,9 +597,15 @@ impl TokenCache {
     #[inline]
     fn get_actions<const IS_PY: bool, C: Ch>(&mut self, env: &mut Env<C>, stack: &mut Stack) -> usize {
         let g = env.g;
+        let at = env.at;
+        let state = stack.state;
+        let fs = at.fast_state(state);
+        let mask = fs.tok_mask;
+        let row_off = fs.act_row_off;
+        let fallback_mask: u32 = if IS_PY { 0 } else { 1u32 << 17 };
+
         let mut action_index = 0usize;
-        let mut main: Option<CachedToken> = None;
-        let mask = g.state_slot(stack.state, 3);
+        let mut main: Option<MainTok> = None;
         let context = if IS_PY { stack.ctx_hash } else { 0 };
         let pos = stack.pos;
         let ch = env.stream.char_at(pos);
@@ -531,7 +620,6 @@ impl TokenCache {
             }
             let tokenizer = unsafe { *g.tokenizers.get_unchecked(i) };
 
-            // Inline fast-reject / fast-emit for external tokenizers (eliminates millions of Stream::resets!)
             match tokenizer {
                 Tok::External { contextual, fallback, extend } => {
                     if main.is_some() && !fallback {
@@ -555,24 +643,18 @@ impl TokenCache {
                                         let si = action_index;
                                         action_index = self.add_actions(
                                             g,
-                                            env.at,
-                                            stack.state,
+                                            at,
+                                            state,
+                                            row_off,
                                             jst::NO_SEMI,
                                             pos,
                                             action_index,
                                         );
-                                        main = Some(CachedToken {
-                                            start: pos,
-                                            value: jst::NO_SEMI,
-                                            end: pos,
-                                            extended: -1,
-                                            look_ahead: 0,
-                                            mask: 0,
-                                            context: 0,
-                                        });
+                                        main = Some(MainTok { start: pos, end: pos, value: jst::NO_SEMI });
                                         if action_index > si {
                                             break;
                                         }
+                                        rem &= fallback_mask;
                                     }
                                 }
                                 continue;
@@ -583,35 +665,27 @@ impl TokenCache {
                                     let si = action_index;
                                     action_index = self.add_actions(
                                         g,
-                                        env.at,
-                                        stack.state,
+                                        at,
+                                        state,
+                                        row_off,
                                         jst::NO_SEMI_TYPE,
                                         pos,
                                         action_index,
                                     );
-                                    main = Some(CachedToken {
-                                        start: pos,
-                                        value: jst::NO_SEMI_TYPE,
-                                        end: pos,
-                                        extended: -1,
-                                        look_ahead: 0,
-                                        mask: 0,
-                                        context: 0,
-                                    });
+                                    main = Some(MainTok { start: pos, end: pos, value: jst::NO_SEMI_TYPE });
                                     if action_index > si {
                                         break;
                                     }
+                                    rem &= fallback_mask;
                                 }
                                 continue;
                             }
                             2 => {
-                                // js_operator_token: only '+', '-', '?'
                                 if ch != 43 && ch != 45 && ch != 63 {
                                     continue;
                                 }
                             }
                             3 => {
-                                // js_jsx: only '<' when JSX dialect enabled
                                 if ch != 60 || !g.dialect_flags[jst::DIALECT_JSX] {
                                     continue;
                                 }
@@ -622,21 +696,14 @@ impl TokenCache {
                                     let si = action_index;
                                     action_index = self.add_actions(
                                         g,
-                                        env.at,
-                                        stack.state,
+                                        at,
+                                        state,
+                                        row_off,
                                         jst::INSERT_SEMI,
                                         pos,
                                         action_index,
                                     );
-                                    main = Some(CachedToken {
-                                        start: pos,
-                                        value: jst::INSERT_SEMI,
-                                        end: pos,
-                                        extended: -1,
-                                        look_ahead: 0,
-                                        mask: 0,
-                                        context: 0,
-                                    });
+                                    main = Some(MainTok { start: pos, end: pos, value: jst::INSERT_SEMI });
                                     if action_index > si {
                                         break;
                                     }
@@ -648,13 +715,11 @@ impl TokenCache {
                     } else {
                         match i {
                             0 => {
-                                // py_legacy_print: only starts with 'p'
                                 if ch != b'p' as i32 {
                                     continue;
                                 }
                             }
                             1 => {
-                                // py_indentation: only when flags == 0 and right after '\n' or '\r'
                                 if stack.ctx_flags != 0 {
                                     continue;
                                 }
@@ -664,29 +729,22 @@ impl TokenCache {
                                 }
                             }
                             2 => {
-                                // py_newlines
                                 if ch < 0 {
                                     let si = action_index;
                                     action_index = self.add_actions(
                                         g,
-                                        env.at,
-                                        stack.state,
+                                        at,
+                                        state,
+                                        row_off,
                                         py::EOF,
                                         pos,
                                         action_index,
                                     );
-                                    main = Some(CachedToken {
-                                        start: pos,
-                                        value: py::EOF,
-                                        end: pos,
-                                        extended: -1,
-                                        look_ahead: 0,
-                                        mask: 0,
-                                        context: 0,
-                                    });
+                                    main = Some(MainTok { start: pos, end: pos, value: py::EOF });
                                     if action_index > si {
                                         break;
                                     }
+                                    rem = 0;
                                     continue;
                                 }
                                 if (stack.ctx_flags & CX_BRACKETED) != 0 {
@@ -695,24 +753,18 @@ impl TokenCache {
                                         let si = action_index;
                                         action_index = self.add_actions(
                                             g,
-                                            env.at,
-                                            stack.state,
+                                            at,
+                                            state,
+                                            row_off,
                                             py::NEWLINE_BRACKETED,
                                             end,
                                             action_index,
                                         );
-                                        main = Some(CachedToken {
-                                            start: pos,
-                                            value: py::NEWLINE_BRACKETED,
-                                            end,
-                                            extended: -1,
-                                            look_ahead: 0,
-                                            mask: 0,
-                                            context: 0,
-                                        });
+                                        main = Some(MainTok { start: pos, end, value: py::NEWLINE_BRACKETED });
                                         if action_index > si {
                                             break;
                                         }
+                                        rem = 0;
                                     }
                                     continue;
                                 }
@@ -723,28 +775,21 @@ impl TokenCache {
                                         let si = action_index;
                                         action_index = self.add_actions(
                                             g,
-                                            env.at,
-                                            stack.state,
+                                            at,
+                                            state,
+                                            row_off,
                                             py::NEWLINE,
                                             end,
                                             action_index,
                                         );
-                                        main = Some(CachedToken {
-                                            start: pos,
-                                            value: py::NEWLINE,
-                                            end,
-                                            extended: -1,
-                                            look_ahead: 0,
-                                            mask: 0,
-                                            context: 0,
-                                        });
+                                        main = Some(MainTok { start: pos, end, value: py::NEWLINE });
                                         if action_index > si {
                                             break;
                                         }
+                                        rem = 0;
                                     }
                                     continue;
                                 }
-                                // Line start (not bracketed): fall through to full `py_newlines`
                             }
                             _ => {}
                         }
@@ -758,7 +803,7 @@ impl TokenCache {
                         env.external::<IS_PY>(i, stack);
                         let mut t = env.stream.tok;
                         if t.value > -1 {
-                            Self::apply_specialize(g, env.at, env.stream.input, &mut t);
+                            Self::apply_specialize::<IS_PY, C>(g, at, env.stream.input, &mut t);
                         } else {
                             t.value = TERM_ERR;
                             t.end = env.stream.clip_pos(start + 1);
@@ -776,8 +821,9 @@ impl TokenCache {
                         if token.extended > -1 {
                             action_index = self.add_actions(
                                 g,
-                                env.at,
-                                stack.state,
+                                at,
+                                state,
+                                row_off,
                                 token.extended,
                                 token.end,
                                 action_index,
@@ -785,17 +831,19 @@ impl TokenCache {
                         }
                         action_index = self.add_actions(
                             g,
-                            env.at,
-                            stack.state,
+                            at,
+                            state,
+                            row_off,
                             token.value,
                             token.end,
                             action_index,
                         );
                         if !extend {
-                            main = Some(token);
+                            main = Some(MainTok { start: token.start, end: token.end, value: token.value });
                             if action_index > start_index {
                                 break;
                             }
+                            rem &= fallback_mask;
                         }
                     }
                 }
@@ -818,7 +866,7 @@ impl TokenCache {
                             context: 0,
                         };
                         if t.value > -1 {
-                            Self::apply_specialize(g, env.at, env.stream.input, &mut t);
+                            Self::apply_specialize::<IS_PY, C>(g, at, env.stream.input, &mut t);
                         } else {
                             t.value = TERM_ERR;
                             t.end = env.stream.clip_pos(start + 1);
@@ -834,8 +882,9 @@ impl TokenCache {
                         if token.extended > -1 {
                             action_index = self.add_actions(
                                 g,
-                                env.at,
-                                stack.state,
+                                at,
+                                state,
+                                row_off,
                                 token.extended,
                                 token.end,
                                 action_index,
@@ -843,16 +892,18 @@ impl TokenCache {
                         }
                         action_index = self.add_actions(
                             g,
-                            env.at,
-                            stack.state,
+                            at,
+                            state,
+                            row_off,
                             token.value,
                             token.end,
                             action_index,
                         );
-                        main = Some(token);
+                        main = Some(MainTok { start: token.start, end: token.end, value: token.value });
                         if action_index > start_index {
                             break;
                         }
+                        rem &= fallback_mask;
                     }
                 }
                 Tok::Local(k) => {
@@ -862,12 +913,29 @@ impl TokenCache {
                     let slot = unsafe { self.tokens.get_unchecked_mut(i) };
                     if slot.start != pos {
                         let start = env.stream.clip_pos(pos);
-                        env.stream.reset(start, Some(*slot));
-                        let lg = &g.locals[k as usize];
-                        local_token(g, lg, &mut env.stream);
-                        let mut t = env.stream.tok;
+                        let fast = if !IS_PY {
+                            fast_js_local(k, env.stream.input, start as usize)
+                        } else {
+                            None
+                        };
+                        let mut t = if let Some((val, end)) = fast {
+                            CachedToken {
+                                start,
+                                value: val,
+                                end,
+                                extended: -1,
+                                look_ahead: (start + 1).min(env.stream.end),
+                                mask: 0,
+                                context: 0,
+                            }
+                        } else {
+                            env.stream.reset(start, Some(*slot));
+                            let lg = &g.locals[k as usize];
+                            local_token(g, lg, &mut env.stream);
+                            env.stream.tok
+                        };
                         if t.value > -1 {
-                            Self::apply_specialize(g, env.at, env.stream.input, &mut t);
+                            Self::apply_specialize::<IS_PY, C>(g, at, env.stream.input, &mut t);
                         } else {
                             t.value = TERM_ERR;
                             t.end = env.stream.clip_pos(start + 1);
@@ -883,8 +951,9 @@ impl TokenCache {
                         if token.extended > -1 {
                             action_index = self.add_actions(
                                 g,
-                                env.at,
-                                stack.state,
+                                at,
+                                state,
+                                row_off,
                                 token.extended,
                                 token.end,
                                 action_index,
@@ -892,64 +961,90 @@ impl TokenCache {
                         }
                         action_index = self.add_actions(
                             g,
-                            env.at,
-                            stack.state,
+                            at,
+                            state,
+                            row_off,
                             token.value,
                             token.end,
                             action_index,
                         );
-                        main = Some(token);
+                        main = Some(MainTok { start: token.start, end: token.end, value: token.value });
                         if action_index > start_index {
                             break;
                         }
+                        rem &= fallback_mask;
                     }
                 }
             }
         }
         if look_ahead != 0 {
-            stack.set_look_ahead(env.bufs, look_ahead);
+            stack.set_look_ahead(look_ahead);
         }
         if main.is_none() && pos == env.stream.end {
-            let mut m = CachedToken::new();
-            m.value = g.eof_term();
-            m.start = pos;
-            m.end = pos;
-            action_index = self.add_actions(g, env.at, stack.state, m.value, m.end, action_index);
-            main = Some(m);
+            let val = g.eof_term();
+            action_index = self.add_actions(g, at, state, row_off, val, pos, action_index);
+            main = Some(MainTok { start: pos, end: pos, value: val });
         }
         self.main_token = main;
         action_index
     }
 
     #[inline(always)]
-    fn apply_specialize<C: Ch>(g: &Grammar, at: &ActionTable, input: &[C], t: &mut CachedToken) {
-        let tv = t.value as usize;
-        if tv < at.spec_idx.len() {
-            let si = unsafe { *at.spec_idx.get_unchecked(tv) };
-            if si >= 0 {
-                let text = &input[t.start as usize..t.end as usize];
-                let result = specialize_text(g, si as usize, text);
-                if result >= 0 && g.allows((result >> 1) as u16) {
-                    if (result & 1) == 0 {
-                        t.value = result >> 1;
-                    } else {
-                        t.extended = result >> 1;
-                    }
+    fn apply_specialize<const IS_PY: bool, C: Ch>(
+        g: &Grammar,
+        at: &ActionTable,
+        input: &[C],
+        t: &mut CachedToken,
+    ) {
+        let tv = t.value;
+        let len = (t.end - t.start) as usize;
+        if IS_PY {
+            if tv != 221 || !(2..=8).contains(&len) {
+                return;
+            }
+        } else if tv == 328 {
+            if !(2..=10).contains(&len) {
+                return;
+            }
+        } else if tv == 344 {
+            if !(3..=9).contains(&len) {
+                return;
+            }
+        } else if tv == 95 {
+            if len == 1 && unsafe { input.get_unchecked(t.start as usize).code() } == b'<' as i32 {
+                // `JS_SPECIALIZED[2]` (`<`) -> 193 (extend = 1, term = 96)
+                if g.allows(96) {
+                    t.extended = 96;
+                }
+            }
+            return;
+        } else {
+            return;
+        }
+        let si = unsafe { *at.spec_idx.get_unchecked(tv as usize) };
+        if si >= 0 {
+            let text = &input[t.start as usize..t.end as usize];
+            let result = specialize_text(g, si as usize, text);
+            if result >= 0 && g.allows((result >> 1) as u16) {
+                if (result & 1) == 0 {
+                    t.value = result >> 1;
+                } else {
+                    t.extended = result >> 1;
                 }
             }
         }
     }
 
-    fn get_main_token<C: Ch>(&self, env: &Env<C>, stack: &Stack) -> CachedToken {
+    fn get_main_token<C: Ch>(&self, env: &Env<C>, stack: &Stack) -> MainTok {
         if let Some(m) = self.main_token {
             return m;
         }
-        let mut main = CachedToken::new();
         let pos = stack.pos;
-        main.start = pos;
-        main.end = (pos + 1).min(env.stream.end);
-        main.value = if pos == env.stream.end { env.g.eof_term() } else { TERM_ERR };
-        main
+        MainTok {
+            start: pos,
+            end: (pos + 1).min(env.stream.end),
+            value: if pos == env.stream.end { env.g.eof_term() } else { TERM_ERR },
+        }
     }
 
     #[inline(always)]
@@ -985,17 +1080,16 @@ impl TokenCache {
         g: &Grammar,
         at: &ActionTable,
         state: u32,
+        row_off: u32,
         token: i32,
         end: i32,
         index: usize,
     ) -> usize {
-        let s = state as usize;
         let t = token as usize;
-        let row = unsafe { *at.row_of_state.get_unchecked(s) };
-        if row == u16::MAX || t >= at.stride {
+        if row_off == u32::MAX || t >= at.stride {
             return self.add_actions_slow(g, state, token, end, index);
         }
-        let lut_idx = unsafe { *at.rows.get_unchecked(row as usize * at.stride + t) };
+        let lut_idx = unsafe { *at.rows.get_unchecked(row_off as usize + t) };
         if lut_idx == 0 {
             return index;
         }
@@ -1067,6 +1161,87 @@ impl TokenCache {
     }
 }
 
+/// SIMD `memchr` fast path for JS `LocalTokenGroup` 0 (template strings) and 1 (block comments).
+#[inline]
+fn fast_js_local<C: Ch>(k: u8, input: &[C], start: usize) -> Option<(i32, i32)> {
+    let bytes = C::as_u8_slice(input)?;
+    let end = bytes.len();
+    if start >= end {
+        return None;
+    }
+    if k == 1 {
+        // Block comment: `\n` -> 325, `*/` -> 326, else -> 324
+        let b0 = unsafe { *bytes.get_unchecked(start) };
+        if b0 == b'\n' {
+            return Some((325, (start + 1) as i32));
+        }
+        if b0 == b'*' && start + 1 < end && unsafe { *bytes.get_unchecked(start + 1) } == b'/' {
+            return Some((326, (start + 2) as i32));
+        }
+        let mut p = start + 1;
+        while p < end {
+            match memchr::memchr2(b'\n', b'*', &bytes[p..end]) {
+                None => {
+                    p = end;
+                    break;
+                }
+                Some(rel) => {
+                    p += rel;
+                    let b = unsafe { *bytes.get_unchecked(p) };
+                    if b == b'\n' || (p + 1 < end && unsafe { *bytes.get_unchecked(p + 1) } == b'/') {
+                        break;
+                    }
+                    p += 1;
+                }
+            }
+        }
+        return Some((324, p as i32));
+    }
+    if k == 0 {
+        // Template string: `${` -> 40, `\` -> 52 (escapes), `` ` `` -> 342, else -> 341
+        let b0 = unsafe { *bytes.get_unchecked(start) };
+        if b0 == b'`' {
+            return Some((342, (start + 1) as i32));
+        }
+        if b0 == b'\\' || (b0 == b'$' && start + 1 < end && bytes[start + 1] == b'{') {
+            return None;
+        }
+        let mut p = start + 1;
+        while p < end {
+            match memchr::memchr3(b'$', b'\\', b'`', &bytes[p..end]) {
+                None => {
+                    p = end;
+                    break;
+                }
+                Some(rel) => {
+                    p += rel;
+                    let b = unsafe { *bytes.get_unchecked(p) };
+                    if b == b'`' {
+                        break;
+                    }
+                    if b == b'$' {
+                        if p + 1 < end && unsafe { *bytes.get_unchecked(p + 1) } == b'{' {
+                            break;
+                        }
+                        p += 1;
+                    } else {
+                        // b == b'\\': guaranteed match of token 52 unless followed by `u`, `x`, or EOF
+                        if p + 1 < end {
+                            let n = unsafe { *bytes.get_unchecked(p + 1) };
+                            if n != b'u' && n != b'x' {
+                                break;
+                            }
+                        }
+                        return None;
+                    }
+                }
+            }
+        }
+        return Some((341, p as i32));
+    }
+    None
+}
+
 #[inline(always)]
 fn specialize_text<C: Ch>(g: &Grammar, index: usize, text: &[C]) -> i32 {
     if let Some(bytes) = C::as_u8_slice(text) {
@@ -1118,40 +1293,36 @@ fn local_token<C: Ch>(g: &Grammar, lg: &LocalGroup, s: &mut Stream<C>) {
 // ---------------------------------------------------------------------------
 
 struct LezerWorkspace {
-    bufs: BufPool,
+    arena: StackArena,
     ctxs: Vec<PyCtx>,
     tokens: TokenCache,
-    reusable_stack: Vec<Frame>,
     flatten_scratch: Vec<Rec>,
-    stacks: Vec<Stack>,
-    new_stacks: Vec<Stack>,
-    stopped: Vec<Stack>,
+    stacks: Vec<u32>,
+    new_stacks: Vec<u32>,
+    stopped: Vec<u32>,
     stopped_tokens: Vec<i32>,
-    work_stacks: Vec<Option<Stack>>,
+    work_stacks: Vec<u32>,
 }
 
 impl LezerWorkspace {
     fn new() -> Self {
         Self {
-            bufs: BufPool::default(),
+            arena: StackArena::default(),
             ctxs: Vec::with_capacity(256),
             tokens: TokenCache::new(),
-            reusable_stack: Vec::with_capacity(64),
             flatten_scratch: Vec::new(),
-            stacks: Vec::with_capacity(4),
-            new_stacks: Vec::new(),
+            stacks: Vec::with_capacity(16),
+            new_stacks: Vec::with_capacity(16),
             stopped: Vec::new(),
             stopped_tokens: Vec::new(),
-            work_stacks: Vec::new(),
+            work_stacks: Vec::with_capacity(16),
         }
     }
 
     fn release(&mut self) {
-        self.bufs.release();
+        self.arena.release();
         self.ctxs.clear();
         self.ctxs.shrink_to_fit();
-        self.reusable_stack.clear();
-        self.reusable_stack.shrink_to_fit();
         self.flatten_scratch.clear();
         self.flatten_scratch.shrink_to_fit();
         self.stacks.clear();
@@ -1176,53 +1347,59 @@ pub fn shrink_tl_workspace() {
 }
 
 // ---------------------------------------------------------------------------
-// Parse driver (const-generic over `IS_PY`)
+// Parse driver (const-generic over `IS_PY`, arena-indexed stacks)
 // ---------------------------------------------------------------------------
 
 struct Parse<'a, 'w, C: Ch> {
     env: Env<'a, 'w, C>,
+    arena: &'w mut StackArena,
     tokens: &'w mut TokenCache,
-    stacks: &'w mut Vec<Stack>,
+    stacks: &'w mut Vec<u32>,
     recovering: i32,
     min_stack_pos: i32,
-    new_stacks: &'w mut Vec<Stack>,
-    stopped: &'w mut Vec<Stack>,
+    new_stacks: &'w mut Vec<u32>,
+    stopped: &'w mut Vec<u32>,
     stopped_tokens: &'w mut Vec<i32>,
-    work_stacks: &'w mut Vec<Option<Stack>>,
+    work_stacks: &'w mut Vec<u32>,
 }
 
-fn push_stack_dedup(stack: Stack, new_stacks: &mut Vec<Stack>) {
-    for other in new_stacks.iter_mut() {
-        if other.pos == stack.pos && other.same_state(&stack) {
+fn push_stack_dedup(arena: &StackArena, id: u32, new_stacks: &mut Vec<u32>) {
+    let stack = arena.get(id);
+    for other_id in new_stacks.iter_mut() {
+        let other = arena.get(*other_id);
+        if other.pos == stack.pos && other.same_state(stack) {
             if other.score < stack.score {
-                *other = stack;
+                *other_id = id;
             }
             return;
         }
     }
-    new_stacks.push(stack);
+    new_stacks.push(id);
 }
 
-fn find_finished(g: &Grammar, end: i32, stacks: &[Stack]) -> Option<usize> {
-    let mut best: Option<usize> = None;
-    for (i, stack) in stacks.iter().enumerate() {
+fn find_finished(at: &ActionTable, arena: &StackArena, end: i32, stacks: &[u32]) -> Option<u32> {
+    let mut best: Option<u32> = None;
+    for &id in stacks {
+        let stack = arena.get(id);
         if stack.pos == end
-            && g.state_flag(stack.state, STATE_ACCEPTING)
-            && best.is_none_or(|b| stacks[b].score < stack.score)
+            && (at.fast_state(stack.state).flags & STATE_ACCEPTING) != 0
+            && best.is_none_or(|b| arena.get(b).score < stack.score)
         {
-            best = Some(i);
+            best = Some(id);
         }
     }
     best
 }
 
 impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
-    fn run_fast<const IS_PY: bool>(&mut self) -> Option<Stack> {
-        let g = self.env.g;
+    fn run_fast<const IS_PY: bool>(&mut self) -> Option<u32> {
+        let at = self.env.at;
         loop {
             if self.stacks.len() == 1 && self.recovering == 0 {
-                let stack = &mut self.stacks[0];
+                let sid = self.arena.collapse_to_root(self.stacks[0]);
+                self.stacks[0] = sid;
                 loop {
+                    let stack = self.arena.get_mut(sid);
                     if self.env.big_count > 300 {
                         while stack.force_reduce::<IS_PY, C>(&mut self.env)
                             && !stack.stack.is_empty()
@@ -1233,7 +1410,7 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
                     }
 
                     loop {
-                        let dr = g.state_slot(stack.state, 4);
+                        let dr = at.fast_state(stack.state).default_reduce;
                         if dr == 0 {
                             break;
                         }
@@ -1258,14 +1435,15 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
 
                     if n == 0 {
                         if stack.pos == self.env.stream.end
-                            && g.state_flag(stack.state, STATE_ACCEPTING)
+                            && (at.fast_state(stack.state).flags & STATE_ACCEPTING) != 0
                         {
-                            return Some(self.stacks.pop().unwrap());
+                            return Some(sid);
                         }
                         self.min_stack_pos = stack.pos;
                         break;
                     }
 
+                    // GLR split: zero-alloc via StackArena & reusable `work_stacks` / `new_stacks`
                     let start = stack.pos;
                     self.min_stack_pos = start;
                     let mut inline = [0i32; INLINE_ACT_CAP];
@@ -1273,8 +1451,12 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
                     self.tokens.copy_actions(n, &mut inline, &mut heap);
                     let actions: &[i32] = if n <= INLINE_ACT_CAP { &inline[..n] } else { &heap[..n] };
                     let main_start = self.tokens.main_token.map(|m| m.start);
-                    let mut new_stacks_tmp = Vec::new();
-                    let mut split_tmp = Vec::new();
+
+                    self.stacks.clear();
+                    self.work_stacks.clear();
+                    self.work_stacks.push(sid);
+                    self.new_stacks.clear();
+
                     let mut i = 0;
                     while i < n {
                         let action = actions[i] as u32;
@@ -1282,27 +1464,21 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
                         let end = actions[i + 2];
                         i += 3;
                         if i == n {
-                            let st = main_start.unwrap_or(stack.pos);
-                            stack.apply::<IS_PY, C>(&mut self.env, action, term, st, end);
+                            let s = self.arena.get_mut(sid);
+                            let st = main_start.unwrap_or(s.pos);
+                            s.apply::<IS_PY, C>(&mut self.env, action, term, st, end);
                         } else {
-                            let mut local = stack.split(self.env.bufs);
+                            let lid = self.arena.split(sid);
+                            let local = self.arena.get_mut(lid);
                             let st = main_start.unwrap_or(local.pos);
                             local.apply::<IS_PY, C>(&mut self.env, action, term, st, end);
                             if local.pos > start {
-                                new_stacks_tmp.push(local);
+                                self.new_stacks.push(lid);
                             } else {
-                                split_tmp.push(local);
+                                self.work_stacks.push(lid);
                             }
                         }
                     }
-                    let primary = self.stacks.pop().unwrap();
-                    self.work_stacks.clear();
-                    self.work_stacks.push(Some(primary));
-                    for s in split_tmp {
-                        self.work_stacks.push(Some(s));
-                    }
-                    self.new_stacks.clear();
-                    self.new_stacks.extend(new_stacks_tmp);
                     if let Some(done) = self.finish_step::<IS_PY>(start) {
                         return Some(done);
                     }
@@ -1316,16 +1492,19 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
         }
     }
 
-    fn advance_slow<const IS_PY: bool>(&mut self) -> Option<Stack> {
+    fn advance_slow<const IS_PY: bool>(&mut self) -> Option<u32> {
+        if self.arena.since_gc > 64 {
+            self.arena.gc(self.stacks);
+        }
         let pos = self.min_stack_pos;
         self.work_stacks.clear();
-        for s in self.stacks.drain(..) {
-            self.work_stacks.push(Some(s));
-        }
+        self.work_stacks.extend_from_slice(self.stacks);
+        self.stacks.clear();
         self.new_stacks.clear();
 
         if self.env.big_count > 300 && self.work_stacks.len() == 1 {
-            let s = self.work_stacks[0].as_mut().unwrap();
+            let sid = self.work_stacks[0];
+            let s = self.arena.get_mut(sid);
             while s.force_reduce::<IS_PY, C>(&mut self.env)
                 && !s.stack.is_empty()
                 && s.stack.last().unwrap().start >= self.env.last_big_start
@@ -1337,24 +1516,24 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
         self.finish_step::<IS_PY>(pos)
     }
 
-    fn finish_step<const IS_PY: bool>(&mut self, pos: i32) -> Option<Stack> {
+    fn finish_step<const IS_PY: bool>(&mut self, pos: i32) -> Option<u32> {
         self.stopped.clear();
         self.stopped_tokens.clear();
 
         let mut i = 0;
         while i < self.work_stacks.len() {
-            let mut stack = self.work_stacks[i].take().unwrap();
+            let sid = self.work_stacks[i];
             loop {
                 self.tokens.main_token = None;
-                if stack.pos > pos {
-                    self.new_stacks.push(stack);
-                } else if self.advance_stack::<IS_PY>(&mut stack, true) {
+                if self.arena.get(sid).pos > pos {
+                    self.new_stacks.push(sid);
+                } else if self.advance_stack::<IS_PY>(sid, true) {
                     continue;
                 } else {
-                    let tok = self.tokens.get_main_token(&self.env, &stack);
+                    let tok = self.tokens.get_main_token(&self.env, self.arena.get(sid));
                     self.stopped_tokens.push(tok.value);
                     self.stopped_tokens.push(tok.end);
-                    self.stopped.push(stack);
+                    self.stopped.push(sid);
                 }
                 break;
             }
@@ -1362,18 +1541,18 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
         }
 
         if self.new_stacks.is_empty() {
-            if let Some(f) = find_finished(self.env.g, self.env.stream.end, self.stopped) {
-                return Some(self.stopped.swap_remove(f));
+            if let Some(f) = find_finished(self.env.at, self.arena, self.env.stream.end, self.stopped) {
+                return Some(f);
             }
             if self.recovering == 0 {
                 self.recovering = 5;
             }
         }
         if self.recovering != 0 && !self.stopped.is_empty() {
-            let stopped_owned = std::mem::take(self.stopped);
+            let stopped_copy = self.stopped.clone();
             let tokens_copy = self.stopped_tokens.clone();
-            if let Some(mut finished) = self.run_recovery::<IS_PY>(stopped_owned, &tokens_copy) {
-                finished.force_all::<IS_PY, C>(&mut self.env);
+            if let Some(finished) = self.run_recovery::<IS_PY>(&stopped_copy, &tokens_copy) {
+                self.arena.get_mut(finished).force_all::<IS_PY, C>(&mut self.env);
                 return Some(finished);
             }
         }
@@ -1384,10 +1563,11 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
                 self.recovering as usize * 3
             };
             if self.new_stacks.len() > max_remaining {
-                self.new_stacks.sort_by_key(|a| std::cmp::Reverse(a.score));
+                let arena = &*self.arena;
+                self.new_stacks.sort_by_key(|&id| std::cmp::Reverse(arena.get(id).score));
                 self.new_stacks.truncate(max_remaining);
             }
-            if self.new_stacks.iter().any(|s| s.reduce_pos > pos) {
+            if self.new_stacks.iter().any(|&id| self.arena.get(id).reduce_pos > pos) {
                 self.recovering -= 1;
             }
         } else if self.new_stacks.len() > 1 {
@@ -1395,9 +1575,10 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
             'outer: while (i as usize) + 1 < self.new_stacks.len() {
                 let mut j = i as usize + 1;
                 while j < self.new_stacks.len() {
-                    let (si, sj) = (&self.new_stacks[i as usize], &self.new_stacks[j]);
-                    let li = si.buf_len_i32(self.env.bufs);
-                    let lj = sj.buf_len_i32(self.env.bufs);
+                    let si = self.arena.get(self.new_stacks[i as usize]);
+                    let sj = self.arena.get(self.new_stacks[j]);
+                    let li = si.buf_len_i32();
+                    let lj = sj.buf_len_i32();
                     if si.same_state(sj) || (li > 500 && lj > 500) {
                         let diff = if si.score != sj.score {
                             si.score - sj.score
@@ -1417,18 +1598,25 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
                 i += 1;
             }
             if self.new_stacks.len() > 12 {
-                self.new_stacks.sort_by_key(|a| std::cmp::Reverse(a.score));
+                let arena = &*self.arena;
+                self.new_stacks.sort_by_key(|&id| std::cmp::Reverse(arena.get(id).score));
                 self.new_stacks.truncate(12);
             }
         }
-        self.min_stack_pos = self.new_stacks.iter().map(|s| s.pos).min().unwrap_or(pos);
+        self.min_stack_pos = self
+            .new_stacks
+            .iter()
+            .map(|&id| self.arena.get(id).pos)
+            .min()
+            .unwrap_or(pos);
         self.stacks.append(self.new_stacks);
         None
     }
 
-    fn advance_stack<const IS_PY: bool>(&mut self, stack: &mut Stack, allow_split: bool) -> bool {
-        let g = self.env.g;
-        let default_reduce = g.state_slot(stack.state, 4);
+    fn advance_stack<const IS_PY: bool>(&mut self, sid: u32, allow_split: bool) -> bool {
+        let at = self.env.at;
+        let stack = self.arena.get_mut(sid);
+        let default_reduce = at.fast_state(stack.state).default_reduce;
         if default_reduce > 0 {
             stack.reduce::<IS_PY, C>(&mut self.env, default_reduce);
             return true;
@@ -1461,80 +1649,134 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
             let end = actions[i + 2];
             i += 3;
             if i == n {
-                let st = main_start.unwrap_or(stack.pos);
-                stack.apply::<IS_PY, C>(&mut self.env, action, term, st, end);
+                let s = self.arena.get_mut(sid);
+                let st = main_start.unwrap_or(s.pos);
+                s.apply::<IS_PY, C>(&mut self.env, action, term, st, end);
                 return true;
             }
-            let mut local = stack.split(self.env.bufs);
+            let lid = self.arena.split(sid);
+            let local = self.arena.get_mut(lid);
             let st = main_start.unwrap_or(local.pos);
             local.apply::<IS_PY, C>(&mut self.env, action, term, st, end);
             if local.pos > start {
-                self.new_stacks.push(local);
+                self.new_stacks.push(lid);
             } else {
-                self.work_stacks.push(Some(local));
+                self.work_stacks.push(lid);
             }
         }
         false
     }
 
-    fn advance_fully<const IS_PY: bool>(&mut self, mut stack: Stack) -> Result<(), Stack> {
-        let pos = stack.pos;
+    fn advance_fully<const IS_PY: bool>(&mut self, sid: u32) -> bool {
+        let pos = self.arena.get(sid).pos;
         loop {
-            if !self.advance_stack::<IS_PY>(&mut stack, false) {
-                return Err(stack);
+            if !self.advance_stack::<IS_PY>(sid, false) {
+                return false;
             }
-            if stack.pos > pos {
-                push_stack_dedup(stack, self.new_stacks);
-                return Ok(());
+            if self.arena.get(sid).pos > pos {
+                push_stack_dedup(self.arena, sid, self.new_stacks);
+                return true;
             }
         }
     }
 
-    fn run_recovery<const IS_PY: bool>(&mut self, stacks: Vec<Stack>, tokens: &[i32]) -> Option<Stack> {
+    fn recover_by_insert<const IS_PY: bool>(&mut self, sid: u32, next: i32) -> Vec<u32> {
         let g = self.env.g;
-        let mut finished: Option<Stack> = None;
+        let (slen, state, pos) = {
+            let s = self.arena.get(sid);
+            (s.stack.len(), s.state, s.pos)
+        };
+        if slen >= 100 {
+            return Vec::new();
+        }
+        let mut next_states = g.next_states(state);
+        if next_states.len() > 8 || slen >= 40 {
+            let mut best: Vec<u32> = Vec::new();
+            let mut i = 0;
+            while i < next_states.len() {
+                let s = next_states[i + 1];
+                if s != state && g.has_action(s, next) != 0 {
+                    best.push(next_states[i]);
+                    best.push(s);
+                }
+                i += 2;
+            }
+            if slen < 40 {
+                let mut i = 0;
+                while best.len() < 8 && i < next_states.len() {
+                    let s = next_states[i + 1];
+                    if !best.iter().enumerate().any(|(j, &v)| (j & 1) == 1 && v == s) {
+                        best.push(next_states[i]);
+                        best.push(s);
+                    }
+                    i += 2;
+                }
+            }
+            next_states = best;
+        }
+        let mut result = Vec::new();
+        let mut i = 0;
+        while i < next_states.len() && result.len() < 4 {
+            let s = next_states[i + 1];
+            if s == state {
+                i += 2;
+                continue;
+            }
+            let lid = self.arena.split(sid);
+            let stack = self.arena.get_mut(lid);
+            stack.push_state(s, pos);
+            stack.store_node(TERM_ERR, stack.pos, stack.pos, 4, true);
+            stack.shift_context::<IS_PY, C>(&mut self.env, next_states[i], pos);
+            stack.reduce_pos = pos;
+            stack.score -= 200;
+            result.push(lid);
+            i += 2;
+        }
+        result
+    }
+
+    fn run_recovery<const IS_PY: bool>(&mut self, stacks: &[u32], tokens: &[i32]) -> Option<u32> {
+        let g = self.env.g;
+        let at = self.env.at;
+        let mut finished: Option<u32> = None;
         let mut restarted = false;
-        for (i, stack) in stacks.into_iter().enumerate() {
-            let mut stack = stack;
+        for (i, &sid) in stacks.iter().enumerate() {
             let mut token = tokens[i << 1];
             let mut token_end = tokens[(i << 1) + 1];
-            if stack.dead_end(g) {
+            if self.arena.get(sid).dead_end(g, at) {
                 if restarted {
                     continue;
                 }
                 restarted = true;
-                stack.restart(self.env.bufs);
-                match self.advance_fully::<IS_PY>(stack) {
-                    Ok(()) => continue,
-                    Err(s) => stack = s,
+                self.arena.get_mut(sid).restart();
+                if self.advance_fully::<IS_PY>(sid) {
+                    continue;
                 }
             }
-            let mut force = stack.split(self.env.bufs);
+            let force = self.arena.split(sid);
+            let mut force_consumed = false;
             for _ in 0..10 {
-                if !force.force_reduce::<IS_PY, C>(&mut self.env) {
+                if !self.arena.get_mut(force).force_reduce::<IS_PY, C>(&mut self.env) {
                     break;
                 }
-                match self.advance_fully::<IS_PY>(force) {
-                    Ok(()) => {
-                        force = stack.split(self.env.bufs);
-                        force.pos = i32::MIN;
-                        break;
-                    }
-                    Err(s) => force = s,
+                if self.advance_fully::<IS_PY>(force) {
+                    force_consumed = true;
+                    break;
                 }
             }
-            for insert in stack.recover_by_insert::<IS_PY, C>(&mut self.env, token) {
+            for insert in self.recover_by_insert::<IS_PY>(sid, token) {
                 let _ = self.advance_fully::<IS_PY>(insert);
             }
-            if self.env.stream.end > stack.pos {
-                if token_end == stack.pos {
+            let spos = self.arena.get(sid).pos;
+            if self.env.stream.end > spos {
+                if token_end == spos {
                     token_end += 1;
                     token = TERM_ERR;
                 }
-                stack.recover_by_delete(self.env.bufs, g, token, token_end);
-                push_stack_dedup(stack, self.new_stacks);
-            } else if force.pos != i32::MIN
-                && finished.as_ref().is_none_or(|f| f.score < force.score)
+                self.arena.get_mut(sid).recover_by_delete(g, token, token_end);
+                push_stack_dedup(self.arena, sid, self.new_stacks);
+            } else if !force_consumed
+                && finished.is_none_or(|f| self.arena.get(f).score < self.arena.get(force).score)
             {
                 finished = Some(force);
             }
@@ -1551,7 +1793,7 @@ pub fn parse_into<C: Ch>(g: &'static Grammar, input: &[C], out: &mut SyntaxTree)
     TL_LEZER.with(|cell| {
         let mut ws = cell.borrow_mut();
         let ws = &mut *ws;
-        ws.bufs.reset();
+        ws.arena.reset();
         ws.ctxs.clear();
         ws.ctxs.push(PyCtx { parent: NULL_CTX, indent: 0, flags: 0, hash: 0 });
         ws.tokens.reset(g.tokenizers.len());
@@ -1561,10 +1803,10 @@ pub fn parse_into<C: Ch>(g: &'static Grammar, input: &[C], out: &mut SyntaxTree)
         ws.stopped_tokens.clear();
         ws.work_stacks.clear();
 
-        let reusable = std::mem::take(&mut ws.reusable_stack);
-        ws.stacks.push(Stack::start(g.top_state, 0, 0, reusable));
+        let start_id = ws.arena.alloc_start(g.top_state, 0, 0);
+        ws.stacks.push(start_id);
 
-        let mut finished = {
+        let done_id = {
             let mut p = Parse {
                 env: Env {
                     g,
@@ -1572,12 +1814,12 @@ pub fn parse_into<C: Ch>(g: &'static Grammar, input: &[C], out: &mut SyntaxTree)
                     at,
                     gt,
                     stream: Stream::new(input),
-                    bufs: &mut ws.bufs,
                     ctxs: &mut ws.ctxs,
                     last_big_start: -1,
                     last_big_size: 0,
                     big_count: 0,
                 },
+                arena: &mut ws.arena,
                 tokens: &mut ws.tokens,
                 stacks: &mut ws.stacks,
                 recovering: 0,
@@ -1594,24 +1836,18 @@ pub fn parse_into<C: Ch>(g: &'static Grammar, input: &[C], out: &mut SyntaxTree)
             }
         };
 
-        finished.close(&mut ws.bufs, g.kind == Kind::Python);
-        let buf_id = finished.buf_id;
-        let end_pos = finished.pos as u32;
-        ws.reusable_stack = finished.stack;
-        if ws.reusable_stack.capacity() > 1024 {
-            ws.reusable_stack.shrink_to(128);
-        }
-
-        let buf = ws.bufs.flatten_into(buf_id, &mut ws.flatten_scratch);
+        ws.arena.get_mut(done_id).close(g.kind == Kind::Python);
+        let end_pos = ws.arena.get(done_id).pos as u32;
+        let buf = ws.arena.flatten_into(done_id, &mut ws.flatten_scratch);
         build_tree_into(g, buf, end_pos, out);
 
-        if ws.flatten_scratch.capacity() > 16384 {
+        if ws.flatten_scratch.capacity() > 32768 {
             ws.flatten_scratch.clear();
             ws.flatten_scratch.shrink_to(4096);
         }
-        if ws.ctxs.capacity() > 4096 {
+        if ws.ctxs.capacity() > 8192 {
             ws.ctxs.clear();
-            ws.ctxs.shrink_to(256);
+            ws.ctxs.shrink_to(512);
         }
     });
 }
