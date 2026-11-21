@@ -22,7 +22,8 @@ use crate::MethodRef;
 
 pub const DEFAULT_SEARCH_LIMIT: usize = 1000;
 const DEFAULT_RESULT_LIMIT: usize = 100;
-const PAR_PRUNE_TOK_THRESHOLD: usize = 1536;
+const PAR_PRUNE_TOK_THRESHOLD: usize = 768;
+const PAR_PRUNE_REC_TOK_THRESHOLD: usize = 1_000_000;
 
 pub struct SearchOptions<'a> {
     pub search_limit: usize,
@@ -68,6 +69,7 @@ pub(crate) struct SearchScratch {
     hist: Vec<u32>,
     bucket_offsets: Vec<u32>,
     bucket_mids: Vec<u32>,
+    raw_cands: Vec<(u64, u32)>,
     pub fast_qmap: FastQueryMap,
     pub prune_target: PruneTarget,
     pub prune_scratch: PruneScratch,
@@ -135,11 +137,12 @@ pub(crate) fn rank_scored<'a>(
     lidx: &'a LanguageIndex,
     query: &Query,
     search_limit: usize,
+    top_k: usize,
     exclude: Option<&(dyn Fn(&MethodRef) -> bool + Sync)>,
     sc: &mut SearchScratch,
 ) -> Vec<ScoredCandidate<'a>> {
     let mcount = lidx.methods.len();
-    if mcount == 0 || search_limit == 0 || query.features.is_empty() || query.size == 0 {
+    if mcount == 0 || search_limit == 0 || top_k == 0 || query.features.is_empty() || query.size == 0 {
         return Vec::new();
     }
 
@@ -148,7 +151,7 @@ pub(crate) fn rank_scored<'a>(
     let max_possible_ov = query.features.len();
     let use_packed_32 = query.size <= u16::MAX as usize && max_possible_ov <= u16::MAX as usize;
 
-    let mut out: Vec<ScoredCandidate<'a>> = Vec::with_capacity(search_limit.min(mcount));
+    sc.raw_cands.clear();
 
     if use_packed_32 {
         sc.acc32.clear();
@@ -161,10 +164,56 @@ pub(crate) fn rank_scored<'a>(
             let pe = lidx.posting_offsets[fi + 1] as usize;
             let slice = &lidx.postings[ps..pe];
             if cap == 1 {
-                for &p in slice {
+                let (chunks, rem) = slice.as_chunks::<4>();
+                for ch in chunks {
+                    let m0 = (ch[0] & MID_MASK) as usize;
+                    let m1 = (ch[1] & MID_MASK) as usize;
+                    let m2 = (ch[2] & MID_MASK) as usize;
+                    let m3 = (ch[3] & MID_MASK) as usize;
+                    unsafe {
+                        let a0 = *acc.get_unchecked(m0);
+                        let a1 = *acc.get_unchecked(m1);
+                        let a2 = *acc.get_unchecked(m2);
+                        let a3 = *acc.get_unchecked(m3);
+                        *acc.get_unchecked_mut(m0) = a0 + 0x0001_0001;
+                        *acc.get_unchecked_mut(m1) = a1 + 0x0001_0001;
+                        *acc.get_unchecked_mut(m2) = a2 + 0x0001_0001;
+                        *acc.get_unchecked_mut(m3) = a3 + 0x0001_0001;
+                    }
+                }
+                for &p in rem {
                     let mid = (p & MID_MASK) as usize;
                     unsafe {
                         *acc.get_unchecked_mut(mid) += 0x0001_0001;
+                    }
+                }
+            } else if cap <= COUNT_OVERFLOW {
+                let (chunks, rem) = slice.as_chunks::<4>();
+                for ch in chunks {
+                    let m0 = (ch[0] & MID_MASK) as usize;
+                    let m1 = (ch[1] & MID_MASK) as usize;
+                    let m2 = (ch[2] & MID_MASK) as usize;
+                    let m3 = (ch[3] & MID_MASK) as usize;
+                    let c0 = (ch[0] >> COUNT_SHIFT).min(cap);
+                    let c1 = (ch[1] >> COUNT_SHIFT).min(cap);
+                    let c2 = (ch[2] >> COUNT_SHIFT).min(cap);
+                    let c3 = (ch[3] >> COUNT_SHIFT).min(cap);
+                    unsafe {
+                        let a0 = *acc.get_unchecked(m0);
+                        let a1 = *acc.get_unchecked(m1);
+                        let a2 = *acc.get_unchecked(m2);
+                        let a3 = *acc.get_unchecked(m3);
+                        *acc.get_unchecked_mut(m0) = a0 + 0x0001_0000 + c0;
+                        *acc.get_unchecked_mut(m1) = a1 + 0x0001_0000 + c1;
+                        *acc.get_unchecked_mut(m2) = a2 + 0x0001_0000 + c2;
+                        *acc.get_unchecked_mut(m3) = a3 + 0x0001_0000 + c3;
+                    }
+                }
+                for &p in rem {
+                    let mid = (p & MID_MASK) as usize;
+                    let cnt = (p >> COUNT_SHIFT).min(cap);
+                    unsafe {
+                        *acc.get_unchecked_mut(mid) += 0x0001_0000 + cnt;
                     }
                 }
             } else {
@@ -189,7 +238,23 @@ pub(crate) fn rank_scored<'a>(
         sc.hist.resize(hist_len, 0u32);
         let mut max_ov = 0usize;
         let mut total_nonzero = 0usize;
-        for &v in acc.iter() {
+        let (chunks, rem) = acc.as_chunks::<8>();
+        for chunk in chunks {
+            if (chunk[0] | chunk[1] | chunk[2] | chunk[3] | chunk[4] | chunk[5] | chunk[6] | chunk[7]) == 0 {
+                continue;
+            }
+            for &v in chunk {
+                if v != 0 {
+                    let ov = (v >> 16) as usize;
+                    unsafe { *sc.hist.get_unchecked_mut(ov) += 1 };
+                    if ov > max_ov {
+                        max_ov = ov;
+                    }
+                    total_nonzero += 1;
+                }
+            }
+        }
+        for &v in rem {
             if v != 0 {
                 let ov = (v >> 16) as usize;
                 unsafe { *sc.hist.get_unchecked_mut(ov) += 1 };
@@ -229,30 +294,51 @@ pub(crate) fn rank_scored<'a>(
         sc.bucket_offsets[range_len] = off;
         sc.bucket_mids.resize(off as usize, 0u32);
 
-        for (mid, &v) in acc.iter().enumerate() {
+        let mut base_mid = 0usize;
+        let (bchunks, brem) = acc.as_chunks::<8>();
+        for chunk in bchunks {
+            if (chunk[0] | chunk[1] | chunk[2] | chunk[3] | chunk[4] | chunk[5] | chunk[6] | chunk[7]) == 0 {
+                base_mid += 8;
+                continue;
+            }
+            for (k, &v) in chunk.iter().enumerate() {
+                let ov = (v >> 16) as usize;
+                if ov >= cutoff {
+                    let b = max_ov - ov;
+                    let p = unsafe { *sc.bucket_offsets.get_unchecked(b) } as usize;
+                    unsafe {
+                        *sc.bucket_mids.get_unchecked_mut(p) = (base_mid + k) as u32;
+                        *sc.bucket_offsets.get_unchecked_mut(b) = (p + 1) as u32;
+                    }
+                }
+            }
+            base_mid += 8;
+        }
+        for (k, &v) in brem.iter().enumerate() {
             let ov = (v >> 16) as usize;
             if ov >= cutoff {
                 let b = max_ov - ov;
                 let p = unsafe { *sc.bucket_offsets.get_unchecked(b) } as usize;
                 unsafe {
-                    *sc.bucket_mids.get_unchecked_mut(p) = mid as u32;
+                    *sc.bucket_mids.get_unchecked_mut(p) = (base_mid + k) as u32;
                     *sc.bucket_offsets.get_unchecked_mut(b) = (p + 1) as u32;
                 }
             }
         }
 
         for &mid in &sc.bucket_mids {
-            if out.len() >= search_limit {
+            if sc.raw_cands.len() >= search_limit {
                 break;
             }
-            if let Some(loc) =
-                first_usable_location(index, lidx, mid as usize, origin, exclude)
-            {
-                out.push(ScoredCandidate { mid, loc, score: acc[mid as usize] & 0xFFFF });
+            if first_usable_location(index, lidx, mid as usize, origin, exclude).is_some() {
+                let score = unsafe { *acc.get_unchecked(mid as usize) } & 0xFFFF;
+                let idx = sc.raw_cands.len() as u64;
+                let key = ((!score as u64) << 32) | idx;
+                sc.raw_cands.push((key, mid));
             }
         }
 
-        if out.len() < search_limit && cutoff > 1 {
+        if sc.raw_cands.len() < search_limit && cutoff > 1 {
             let mut rest: Vec<(u32, u32, u32)> = Vec::new();
             for (mid, &v) in acc.iter().enumerate() {
                 let ov = v >> 16;
@@ -262,13 +348,13 @@ pub(crate) fn rank_scored<'a>(
             }
             rest.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
             for (_, mid, score) in rest {
-                if out.len() >= search_limit {
+                if sc.raw_cands.len() >= search_limit {
                     break;
                 }
-                if let Some(loc) =
-                    first_usable_location(index, lidx, mid as usize, origin, exclude)
-                {
-                    out.push(ScoredCandidate { mid, loc, score });
+                if first_usable_location(index, lidx, mid as usize, origin, exclude).is_some() {
+                    let idx = sc.raw_cands.len() as u64;
+                    let key = ((!score as u64) << 32) | idx;
+                    sc.raw_cands.push((key, mid));
                 }
             }
         }
@@ -299,20 +385,32 @@ pub(crate) fn rank_scored<'a>(
         }
         cands.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         for (_, mid, score) in cands {
-            if out.len() >= search_limit {
+            if sc.raw_cands.len() >= search_limit {
                 break;
             }
-            if let Some(loc) =
-                first_usable_location(index, lidx, mid as usize, origin, exclude)
-            {
-                out.push(ScoredCandidate { mid, loc, score });
+            if first_usable_location(index, lidx, mid as usize, origin, exclude).is_some() {
+                let idx = sc.raw_cands.len() as u64;
+                let key = ((!score as u64) << 32) | idx;
+                sc.raw_cands.push((key, mid));
             }
         }
     }
 
-    // Stably sort by `score DESC` (preserving Phase I order on ties!)
-    out.sort_by_key(|a| std::cmp::Reverse(a.score));
-    out
+    // Partition and sort only the needed `top_k` candidates by `(score DESC, phase1_idx ASC)`.
+    let keep = sc.raw_cands.len().min(top_k);
+    if sc.raw_cands.len() > keep {
+        sc.raw_cands.select_nth_unstable_by_key(keep - 1, |&(k, _)| k);
+        sc.raw_cands.truncate(keep);
+    }
+    sc.raw_cands.sort_unstable_by_key(|&(k, _)| k);
+    sc.raw_cands
+        .iter()
+        .map(|&(k, mid)| {
+            let loc = first_usable_location(index, lidx, mid as usize, origin, exclude)
+                .expect("candidate was already verified usable");
+            ScoredCandidate { mid, loc, score: !((k >> 32) as u32) }
+        })
+        .collect()
 }
 
 fn matched_lines_of(lidx: &LanguageIndex, loc: &MethodLocation, tokens: &[usize]) -> Vec<u32> {
@@ -389,7 +487,15 @@ pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) ->
     TL_SEARCH.with(|cell| {
         let mut sc = cell.borrow_mut();
         let sc = &mut *sc;
-        let scored = rank_scored(index, lidx, query, options.search_limit, options.exclude, sc);
+        let scored = rank_scored(
+            index,
+            lidx,
+            query,
+            options.search_limit,
+            options.limit,
+            options.exclude,
+            sc,
+        );
 
         // Slice strictly to the surviving hits (`similarity > min_similarity`, `<= limit`)
         let mut survive_end = 0usize;
@@ -416,7 +522,7 @@ pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) ->
         let ptarget = &sc.prune_target;
 
         let results = if let Some(pool) = index.pool.as_ref()
-            && survivors.len() >= 8
+            && survivors.len() >= 4
             && total_toks >= PAR_PRUNE_TOK_THRESHOLD
         {
             pool.install(|| {
@@ -517,7 +623,7 @@ pub(crate) fn rank_for_recommend<'a>(
     if cluster_limit == 0 || search_limit == 0 || query.size == 0 || query.features.is_empty() {
         return Vec::new();
     }
-    let scored = rank_scored(index, lidx, query, search_limit, exclude, sc);
+    let scored = rank_scored(index, lidx, query, search_limit, cluster_limit, exclude, sc);
     let qsize = query.size as f64;
     let mut survive_end = 0usize;
     let mut total_toks = 0usize;
@@ -542,8 +648,8 @@ pub(crate) fn rank_for_recommend<'a>(
     let ptarget = &sc.prune_target;
 
     let out = if let Some(pool) = index.pool.as_ref()
-        && survivors.len() >= 8
-        && total_toks >= PAR_PRUNE_TOK_THRESHOLD
+        && survivors.len() >= 16
+        && total_toks >= PAR_PRUNE_REC_TOK_THRESHOLD
     {
         pool.install(|| {
             survivors

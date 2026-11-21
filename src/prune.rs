@@ -1,15 +1,13 @@
 //! Algorithm 1 of the Aroma paper (`prune`) with two exact fast paths:
-//! 1. `FastQueryMap`: 4 KB L1 Bloom filter + direct `qidx[fid]` table (only the
-//!    ~50-100 active query feature slots are ever read on Bloom hits, staying
-//!    pinned in L1 cache with zero hash-probing loops).
+//! 1. `FastQueryMap`: 4 KB L1 Bloom filter + direct L1-hot `qidx[fid]` table.
 //! 2. Adaptive exact greedy descent:
-//!    - Small methods (`tok_count < SIG_THRESHOLD` or explicit `candidates`):
-//!      direct bucket descent with dirty-bucket skip-sort and single-hit capping.
-//!    - Medium/large methods (`tok_count >= SIG_THRESHOLD`, `candidates: None`):
-//!      exact signature-equivalence-class greedy (`run_greedy_sig`) with inline
-//!      `k == 1` direct-array and `k == 2` packed-`u64` fast paths, exact
-//!      `ceil(cap / mult)` per-class capping, and O(1) bulk demotion via a tiny
-//!      min-heap.
+//!    - Zero-greedy fast path: when `sum_t gain_0(t) == expected_score`, every
+//!      token with `gain_0(t) > 0` is necessarily kept with no greedy descent.
+//!    - `max_gain == 1` fast path: single linear scan over hitting tokens.
+//!    - Small/medium hitting sets (`tok_hits.len() < SIG_THRESHOLD` or explicit
+//!      `candidates`): direct bucket descent with dirty-bucket skip-sort.
+//!    - Large hitting sets (`tok_hits.len() >= SIG_THRESHOLD`, `candidates: None`):
+//!      exact signature-equivalence-class greedy (`run_greedy_sig`).
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -44,7 +42,7 @@ pub fn prune(
 }
 
 // ============================================================================
-// Direct-indexed 4 KB L1 Bloom + `qidx[fid]` map (`FastQueryMap`)
+// 4 KB L1 Bloom + compact L1-resident open-addressed `QSlot` map (`FastQueryMap`)
 // ============================================================================
 
 const BLOOM_WORDS: usize = 512; // 32,768 bits = 4 KB
@@ -215,8 +213,11 @@ struct TokHits {
 
 #[derive(Clone, Copy)]
 struct SigSlot {
-    /// For `k == 2` inline fast path: `tag = (1 << 63) | ((q0 as u64) << 16) | (q1 as u64)`.
-    /// For `k >= 3`: `tag = hash & !(1 << 63)`.
+    /// Top 2 bits encode inline tag kind:
+    /// - `0b00`: `k >= 5` (or `k == 4` with `q >= 32768`), 62-bit hash of sorted `hits`
+    /// - `0b01`: `k == 2` inline `(q0 << 16) | q1`
+    /// - `0b10`: `k == 3` inline `(q0 << 32) | (q1 << 16) | q2`
+    /// - `0b11`: `k == 4` inline `(q0 << 45) | (q1 << 30) | (q2 << 15) | q3` (when `q_len <= 32768`)
     tag: u64,
     cls_id: u32,
     epoch: u32,
@@ -278,8 +279,8 @@ impl PruneScratch {
         let mut new_slots = vec![SigSlot { tag: 0, cls_id: 0, epoch: 0 }; new_cap];
         for s in &self.sig_slots {
             if s.epoch == epoch {
-                let h = if (s.tag & (1u64 << 63)) != 0 {
-                    mix_pair(s.tag)
+                let h = if (s.tag >> 62) != 0 {
+                    mix_u64(s.tag)
                 } else {
                     s.tag as usize
                 };
@@ -295,9 +296,11 @@ impl PruneScratch {
 }
 
 #[inline(always)]
-fn mix_pair(tag: u64) -> usize {
-    let x = (tag as u32).wrapping_mul(0x9E37_79B9);
-    (x ^ (x >> 16)) as usize
+fn mix_u64(x: u64) -> usize {
+    let mut z = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z ^= z >> 30;
+    z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    (z ^ (z >> 27)) as usize
 }
 
 #[inline(always)]
@@ -320,7 +323,7 @@ fn hash_sig(hits: &[u32]) -> u64 {
     for &q in hits {
         h = (h ^ (q as u64)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     }
-    (h ^ (h >> 31)) & !(1u64 << 63)
+    (h ^ (h >> 31)) & ((1u64 << 62) - 1)
 }
 
 #[inline(always)]
@@ -370,10 +373,14 @@ fn run_greedy_buckets(
         }
         std::mem::swap(&mut scratch.cur_bucket, &mut scratch.buckets[val]);
         if val >= 64 || (dirty_mask & (1u64 << val)) != 0 {
-            let tok_hits = &scratch.tok_hits;
-            scratch.cur_bucket.sort_unstable_by_key(|&ei| unsafe {
-                tok_hits.get_unchecked(ei as usize).token
-            });
+            if initial_sorted {
+                scratch.cur_bucket.sort_unstable();
+            } else {
+                let tok_hits = &scratch.tok_hits;
+                scratch.cur_bucket.sort_unstable_by_key(|&ei| unsafe {
+                    tok_hits.get_unchecked(ei as usize).token
+                });
+            }
         }
 
         let n = scratch.cur_bucket.len();
@@ -452,9 +459,69 @@ fn run_greedy_sig(
     let mut score = 0usize;
 
     'outer: for val in (1..=max_gain).rev() {
-        if scratch.buckets[val].is_empty() {
+        let blen = scratch.buckets[val].len();
+        if blen == 0 {
             continue;
         }
+        // Single-class bucket fast path: avoid BinaryHeap completely.
+        if blen == 1 {
+            let cid = scratch.buckets[val][0];
+            scratch.buckets[val].clear();
+            let c = unsafe { *scratch.sig_classes.get_unchecked(cid as usize) };
+            let hits = &scratch.sig_qfids[c.sig_start as usize..c.sig_end as usize];
+            let cur_gain = compute_gain_sorted(hits, c.has_dup, &scratch.rem);
+            if cur_gain < val {
+                if cur_gain > 0 {
+                    scratch.buckets[cur_gain].push(cid);
+                }
+                continue;
+            }
+            let mut node = c.tok_head;
+            loop {
+                let (tok, next_node) = unsafe { *scratch.tok_nodes.get_unchecked(node as usize) };
+                kept.push(tok as usize);
+                score += val;
+                let mut next_gain = 0usize;
+                if !c.has_dup {
+                    for &q in hits {
+                        let r = unsafe { scratch.rem.get_unchecked_mut(q as usize) };
+                        if *r > 0 {
+                            *r -= 1;
+                            next_gain += (*r > 0) as usize;
+                        }
+                    }
+                } else {
+                    for &q in hits {
+                        let r = unsafe { scratch.rem.get_unchecked_mut(q as usize) };
+                        if *r > 0 {
+                            *r -= 1;
+                        }
+                    }
+                    if next_node != u32::MAX {
+                        next_gain = compute_gain_sorted(hits, true, &scratch.rem);
+                    }
+                }
+                if expected_score == Some(score) {
+                    for b in &mut scratch.buckets[1..val] {
+                        b.clear();
+                    }
+                    break 'outer;
+                }
+                if next_node == u32::MAX {
+                    break;
+                }
+                if next_gain < val {
+                    unsafe { scratch.sig_classes.get_unchecked_mut(cid as usize).tok_head = next_node };
+                    if next_gain > 0 {
+                        scratch.buckets[next_gain].push(cid);
+                    }
+                    break;
+                }
+                node = next_node;
+            }
+            continue;
+        }
+
         scratch.bucket_heap.clear();
         for &cid in &scratch.buckets[val] {
             let head_node = unsafe { scratch.sig_classes.get_unchecked(cid as usize).tok_head };
@@ -463,7 +530,7 @@ fn run_greedy_sig(
         }
         scratch.buckets[val].clear();
 
-        while let Some(Reverse((head_tok, cid))) = scratch.bucket_heap.pop() {
+        while let Some(Reverse((mut head_tok, cid))) = scratch.bucket_heap.pop() {
             let c = unsafe { *scratch.sig_classes.get_unchecked(cid as usize) };
             let hits = &scratch.sig_qfids[c.sig_start as usize..c.sig_end as usize];
             let cur_gain = compute_gain_sorted(hits, c.has_dup, &scratch.rem);
@@ -475,31 +542,55 @@ fn run_greedy_sig(
                 continue;
             }
 
-            kept.push(head_tok as usize);
-            score += val;
-            for &q in hits {
-                let r = unsafe { scratch.rem.get_unchecked_mut(q as usize) };
-                if *r > 0 {
-                    *r -= 1;
+            let peek_tok = scratch.bucket_heap.peek().map_or(u32::MAX, |&Reverse((t, _))| t);
+            let mut node = c.tok_head;
+            loop {
+                kept.push(head_tok as usize);
+                score += val;
+                let mut next_gain = 0usize;
+                if !c.has_dup {
+                    for &q in hits {
+                        let r = unsafe { scratch.rem.get_unchecked_mut(q as usize) };
+                        if *r > 0 {
+                            *r -= 1;
+                            next_gain += (*r > 0) as usize;
+                        }
+                    }
+                } else {
+                    for &q in hits {
+                        let r = unsafe { scratch.rem.get_unchecked_mut(q as usize) };
+                        if *r > 0 {
+                            *r -= 1;
+                        }
+                    }
+                    next_gain = compute_gain_sorted(hits, true, &scratch.rem);
                 }
-            }
-            if expected_score == Some(score) {
-                scratch.bucket_heap.clear();
-                for b in &mut scratch.buckets[1..val] {
-                    b.clear();
+                if expected_score == Some(score) {
+                    scratch.bucket_heap.clear();
+                    for b in &mut scratch.buckets[1..val] {
+                        b.clear();
+                    }
+                    break 'outer;
                 }
-                break 'outer;
-            }
 
-            let next_node = unsafe { scratch.tok_nodes.get_unchecked(c.tok_head as usize).1 };
-            if next_node != u32::MAX {
-                unsafe { scratch.sig_classes.get_unchecked_mut(cid as usize).tok_head = next_node };
-                let next_gain = compute_gain_sorted(hits, c.has_dup, &scratch.rem);
-                if next_gain == val {
-                    let next_tok = unsafe { scratch.tok_nodes.get_unchecked(next_node as usize).0 };
+                let next_node = unsafe { scratch.tok_nodes.get_unchecked(node as usize).1 };
+                if next_node == u32::MAX {
+                    break;
+                }
+                if next_gain < val {
+                    unsafe { scratch.sig_classes.get_unchecked_mut(cid as usize).tok_head = next_node };
+                    if next_gain > 0 {
+                        scratch.buckets[next_gain].push(cid);
+                    }
+                    break;
+                }
+                let next_tok = unsafe { scratch.tok_nodes.get_unchecked(next_node as usize).0 };
+                node = next_node;
+                head_tok = next_tok;
+                if next_tok >= peek_tok {
+                    unsafe { scratch.sig_classes.get_unchecked_mut(cid as usize).tok_head = next_node };
                     scratch.bucket_heap.push(Reverse((next_tok, cid)));
-                } else if next_gain > 0 {
-                    scratch.buckets[next_gain].push(cid);
+                    break;
                 }
             }
         }
@@ -509,7 +600,7 @@ fn run_greedy_sig(
     Pruned { tokens: kept, score }
 }
 
-const SIG_THRESHOLD: usize = 256;
+const SIG_THRESHOLD: usize = 512;
 
 /// Fast Algorithm 1 using 4 KB L1 Bloom + direct L1-hot `qidx[fid]`.
 pub(crate) fn prune_with_fast_map(
@@ -542,6 +633,7 @@ pub(crate) fn prune_with_fast_map(
     let qidx = &qmap.qidx;
     let caps = &qmap.caps;
     let mut max_gain = 0usize;
+    let mut total_gain = 0usize;
     let ascending = candidates.is_none_or(|c| c.windows(2).all(|w| w[0] < w[1]));
 
     let mut process_token = |tok: usize| {
@@ -561,6 +653,38 @@ pub(crate) fn prune_with_fast_map(
                 hit_bits |= (b as u32) << i;
             }
             if hit_bits == 0 {
+                return;
+            }
+            if hit_bits & (hit_bits - 1) == 0 {
+                let i = hit_bits.trailing_zeros() as usize;
+                let f = unsafe { *slice.get_unchecked(i) };
+                let q16 = unsafe { *qidx.get_unchecked(f as usize) };
+                if q16 != u16::MAX {
+                    let q = q16 as usize;
+                    total_gain += 1;
+                    if ascending {
+                        let seen = unsafe { scratch.single_seen.get_unchecked_mut(q) };
+                        if *seen >= unsafe { *caps.get_unchecked(q) } {
+                            return;
+                        }
+                        *seen += 1;
+                    }
+                    scratch.hit_qfids.push(q16 as u32);
+                    let ei = scratch.tok_hits.len() as u32;
+                    scratch.tok_hits.push(TokHits {
+                        token: tok as u32,
+                        start: hit_start,
+                        end: hit_start + 1,
+                        has_dup: false,
+                    });
+                    if scratch.buckets.len() <= 1 {
+                        scratch.buckets.resize_with(2, Vec::new);
+                    }
+                    scratch.buckets[1].push(ei);
+                    if max_gain < 1 {
+                        max_gain = 1;
+                    }
+                }
                 return;
             }
             let mut hb = hit_bits;
@@ -618,6 +742,7 @@ pub(crate) fn prune_with_fast_map(
         if gain == 0 {
             return;
         }
+        total_gain += gain;
         let hit_end = scratch.hit_qfids.len() as u32;
         if ascending && hit_end - hit_start == 1 {
             let q = scratch.hit_qfids[hit_start as usize] as usize;
@@ -652,10 +777,20 @@ pub(crate) fn prune_with_fast_map(
         }
     }
 
+    if expected_score == Some(total_gain) && total_gain > 0 {
+        for b in &mut scratch.buckets[1..=max_gain] {
+            b.clear();
+        }
+        let mut tokens: Vec<usize> = scratch.tok_hits.iter().map(|th| th.token as usize).collect();
+        if !ascending {
+            tokens.sort_unstable();
+        }
+        return Pruned { tokens, score: total_gain };
+    }
+
     run_greedy_buckets(max_gain, expected_score, ascending, scratch)
 }
 
-/// Exact signature-equivalence-class Algorithm 1 for large methods (`>= SIG_THRESHOLD` tokens).
 fn prune_with_fast_map_sig(
     qmap: &FastQueryMap,
     all_features: &[u32],
@@ -735,7 +870,6 @@ fn prune_with_fast_map_sig(
             continue;
         }
 
-        // Fast path 1: `k == 1` — direct O(1) array lookup
         if !use_overflow && k == 1 {
             let q = local_q[0];
             let existing = unsafe { *scratch.sig_single_cls.get_unchecked(q as usize) };
@@ -779,15 +913,14 @@ fn prune_with_fast_map_sig(
         let epoch = scratch.sig_epoch;
         let mask = scratch.sig_slots.len() - 1;
 
-        // Fast path 2: `k == 2` — exact packed tag in `SigSlot` (zero `sig_qfids` dereference on probe!)
         if !use_overflow && k == 2 {
             let (q0, q1) = if local_q[0] <= local_q[1] {
                 (local_q[0], local_q[1])
             } else {
                 (local_q[1], local_q[0])
             };
-            let tag = (1u64 << 63) | ((q0 as u64) << 16) | (q1 as u64);
-            let mut pos = mix_pair(tag) & mask;
+            let tag = (1u64 << 62) | ((q0 as u64) << 16) | (q1 as u64);
+            let mut pos = mix_u64(tag) & mask;
             let found_cid = loop {
                 let slot = unsafe { *scratch.sig_slots.get_unchecked(pos) };
                 if slot.epoch != epoch {
@@ -848,10 +981,180 @@ fn prune_with_fast_map_sig(
             continue;
         }
 
-        // General path: `k >= 3`
+        if !use_overflow && k == 3 {
+            let mut q0 = local_q[0];
+            let mut q1 = local_q[1];
+            let mut q2 = local_q[2];
+            if q0 > q1 { std::mem::swap(&mut q0, &mut q1); }
+            if q1 > q2 { std::mem::swap(&mut q1, &mut q2); }
+            if q0 > q1 { std::mem::swap(&mut q0, &mut q1); }
+            let tag = (2u64 << 62) | ((q0 as u64) << 32) | ((q1 as u64) << 16) | (q2 as u64);
+            let mut pos = mix_u64(tag) & mask;
+            let found_cid = loop {
+                let slot = unsafe { *scratch.sig_slots.get_unchecked(pos) };
+                if slot.epoch != epoch {
+                    break u32::MAX;
+                }
+                if slot.tag == tag {
+                    break slot.cls_id;
+                }
+                pos = (pos + 1) & mask;
+            };
+            if found_cid != u32::MAX {
+                let c = unsafe { scratch.sig_classes.get_unchecked_mut(found_cid as usize) };
+                if c.count < c.max_needed {
+                    let nid = scratch.tok_nodes.len() as u32;
+                    scratch.tok_nodes.push((tok as u32, u32::MAX));
+                    unsafe { scratch.tok_nodes.get_unchecked_mut(c.tok_tail as usize).1 = nid };
+                    c.tok_tail = nid;
+                    c.count += 1;
+                }
+                continue;
+            }
+            let c0 = unsafe { *caps.get_unchecked(q0 as usize) };
+            let c1 = unsafe { *caps.get_unchecked(q1 as usize) };
+            let c2 = unsafe { *caps.get_unchecked(q2 as usize) };
+            let (gain, has_dup, max_needed) = if q0 != q1 && q1 != q2 {
+                (3usize, false, c0.max(c1).max(c2))
+            } else if q0 == q1 && q1 == q2 {
+                (3u32.min(c0) as usize, true, c0.div_ceil(3))
+            } else if q0 == q1 {
+                (2u32.min(c0) as usize + 1, true, c0.div_ceil(2).max(c2))
+            } else {
+                (1 + 2u32.min(c1) as usize, true, c0.max(c1.div_ceil(2)))
+            };
+            let sig_start = scratch.sig_qfids.len() as u32;
+            scratch.sig_qfids.push(q0);
+            scratch.sig_qfids.push(q1);
+            scratch.sig_qfids.push(q2);
+            let nid = scratch.tok_nodes.len() as u32;
+            scratch.tok_nodes.push((tok as u32, u32::MAX));
+            let cid = scratch.sig_classes.len() as u32;
+            scratch.sig_classes.push(SigClass {
+                sig_start,
+                sig_end: sig_start + 3,
+                has_dup,
+                max_needed,
+                count: 1,
+                tok_head: nid,
+                tok_tail: nid,
+            });
+            unsafe {
+                *scratch.sig_slots.get_unchecked_mut(pos) = SigSlot { tag, cls_id: cid, epoch };
+            }
+            if scratch.sig_classes.len() * 4 >= scratch.sig_slots.len() {
+                scratch.grow_sig_table();
+            }
+            if gain >= scratch.buckets.len() {
+                scratch.buckets.resize_with(gain + 1, Vec::new);
+            }
+            scratch.buckets[gain].push(cid);
+            if gain > max_gain {
+                max_gain = gain;
+            }
+            continue;
+        }
+
+        if !use_overflow && k == 4 && q_len <= 32768 {
+            let mut q0 = local_q[0];
+            let mut q1 = local_q[1];
+            let mut q2 = local_q[2];
+            let mut q3 = local_q[3];
+            if q0 > q1 { std::mem::swap(&mut q0, &mut q1); }
+            if q2 > q3 { std::mem::swap(&mut q2, &mut q3); }
+            if q0 > q2 { std::mem::swap(&mut q0, &mut q2); }
+            if q1 > q3 { std::mem::swap(&mut q1, &mut q3); }
+            if q1 > q2 { std::mem::swap(&mut q1, &mut q2); }
+            let tag = (3u64 << 62) | ((q0 as u64) << 45) | ((q1 as u64) << 30) | ((q2 as u64) << 15) | (q3 as u64);
+            let mut pos = mix_u64(tag) & mask;
+            let found_cid = loop {
+                let slot = unsafe { *scratch.sig_slots.get_unchecked(pos) };
+                if slot.epoch != epoch {
+                    break u32::MAX;
+                }
+                if slot.tag == tag {
+                    break slot.cls_id;
+                }
+                pos = (pos + 1) & mask;
+            };
+            if found_cid != u32::MAX {
+                let c = unsafe { scratch.sig_classes.get_unchecked_mut(found_cid as usize) };
+                if c.count < c.max_needed {
+                    let nid = scratch.tok_nodes.len() as u32;
+                    scratch.tok_nodes.push((tok as u32, u32::MAX));
+                    unsafe { scratch.tok_nodes.get_unchecked_mut(c.tok_tail as usize).1 = nid };
+                    c.tok_tail = nid;
+                    c.count += 1;
+                }
+                continue;
+            }
+            let mut gain = 0usize;
+            let mut has_dup = false;
+            let mut max_needed = 0u32;
+            let arr = [q0, q1, q2, q3];
+            let mut i = 0usize;
+            while i < 4 {
+                let q = arr[i];
+                let mut j = i + 1;
+                while j < 4 && arr[j] == q {
+                    j += 1;
+                }
+                let mult = (j - i) as u32;
+                if mult > 1 {
+                    has_dup = true;
+                }
+                let cap = unsafe { *caps.get_unchecked(q as usize) };
+                gain += mult.min(cap) as usize;
+                let need = cap.div_ceil(mult);
+                if need > max_needed {
+                    max_needed = need;
+                }
+                i = j;
+            }
+            let sig_start = scratch.sig_qfids.len() as u32;
+            scratch.sig_qfids.extend_from_slice(&arr);
+            let nid = scratch.tok_nodes.len() as u32;
+            scratch.tok_nodes.push((tok as u32, u32::MAX));
+            let cid = scratch.sig_classes.len() as u32;
+            scratch.sig_classes.push(SigClass {
+                sig_start,
+                sig_end: sig_start + 4,
+                has_dup,
+                max_needed,
+                count: 1,
+                tok_head: nid,
+                tok_tail: nid,
+            });
+            unsafe {
+                *scratch.sig_slots.get_unchecked_mut(pos) = SigSlot { tag, cls_id: cid, epoch };
+            }
+            if scratch.sig_classes.len() * 4 >= scratch.sig_slots.len() {
+                scratch.grow_sig_table();
+            }
+            if gain >= scratch.buckets.len() {
+                scratch.buckets.resize_with(gain + 1, Vec::new);
+            }
+            scratch.buckets[gain].push(cid);
+            if gain > max_gain {
+                max_gain = gain;
+            }
+            continue;
+        }
+
+        // General path: `k >= 5` (or `k == 4` with `q_len > 32768`)
         let hits: &[u32] = if !use_overflow {
-            sort_small_u32(&mut local_q[..k]);
-            &local_q[..k]
+            let s = &mut local_q[..k];
+            let mut already_sorted = true;
+            for w in s.windows(2) {
+                if w[0] > w[1] {
+                    already_sorted = false;
+                    break;
+                }
+            }
+            if !already_sorted {
+                sort_small_u32(s);
+            }
+            s
         } else {
             overflow_q.sort_unstable();
             &overflow_q
