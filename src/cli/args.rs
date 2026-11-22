@@ -4,14 +4,14 @@ use std::path::PathBuf;
 
 use crate::cli::error::{closest_match, CliError};
 
-pub const MAX_TOP: usize = 10_000;
-pub const MAX_SEARCH_LIMIT: usize = 100_000;
-pub const MAX_CLUSTER_LIMIT: usize = 10_000;
-pub const MAX_THREADS: usize = 256;
-pub const DEFAULT_MAX_FILE_BYTES: usize = 500_000;
-pub const MAX_FILE_BYTES_CAP: usize = 100_000_000;
-pub const MAX_SNIPPET_BYTES: usize = 10_000_000;
-pub const MAX_LINE_SPEC_COUNT: usize = 100_000;
+pub(crate) const MAX_TOP: usize = 10_000;
+pub(crate) const MAX_SEARCH_LIMIT: usize = 100_000;
+pub(crate) const MAX_CLUSTER_LIMIT: usize = 10_000;
+pub(crate) const MAX_THREADS: usize = 256;
+pub(crate) const DEFAULT_MAX_FILE_BYTES: usize = 500_000;
+pub(crate) const MAX_FILE_BYTES_CAP: usize = 100_000_000;
+pub(crate) const MAX_SNIPPET_BYTES: usize = 10_000_000;
+pub(crate) const MAX_LINE_SPEC_COUNT: usize = 100_000;
 
 const KNOWN_SUBCOMMANDS: &[&str] = &[
     "triage",
@@ -28,31 +28,31 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
 const KNOWN_ENV_VARS: &[&str] = &["AROMA_NO_ENV_WARN", "AROMA_ROBOT", "AROMA_THREADS"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputMode {
+pub(crate) enum OutputMode {
     Human,
     Json,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TestFilter {
+pub(crate) enum TestFilter {
     ExcludeTests,
     IncludeTests,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OriginFilter {
+pub(crate) enum OriginFilter {
     ExcludeOrigin,
     IncludeOrigin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecsMode {
+pub(crate) enum RecsMode {
     Omit,
     Include,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HelpTopic {
+pub(crate) enum HelpTopic {
     Root,
     Triage,
     Clones,
@@ -65,12 +65,12 @@ pub enum HelpTopic {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DocsTopic {
+pub(crate) enum DocsTopic {
     Guide,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchemaCommand {
+pub(crate) enum SchemaCommand {
     Triage,
     Clones,
     Search,
@@ -80,7 +80,7 @@ pub enum SchemaCommand {
 }
 
 impl SchemaCommand {
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Triage => "triage",
             Self::Clones => "clones",
@@ -93,7 +93,7 @@ impl SchemaCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QuerySource {
+pub(crate) enum QuerySource {
     Snippet(String),
     SnippetFile(PathBuf),
     FileLines { file: PathBuf, lines: Vec<u32> },
@@ -101,78 +101,78 @@ pub enum QuerySource {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TriageCmd {
-    pub paths: Vec<PathBuf>,
-    pub mode: OutputMode,
-    pub threads: Option<usize>,
-    pub top: usize,
-    pub min_sim: f64,
-    pub min_lines: u32,
-    pub min_tokens: usize,
-    pub lang: Option<String>,
-    pub tests: TestFilter,
-    pub ignores: Vec<String>,
-    pub max_file_bytes: usize,
+pub(crate) struct TriageCmd {
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) mode: OutputMode,
+    pub(crate) threads: Option<usize>,
+    pub(crate) top: usize,
+    pub(crate) min_sim: f64,
+    pub(crate) min_lines: u32,
+    pub(crate) min_tokens: usize,
+    pub(crate) lang: Option<String>,
+    pub(crate) tests: TestFilter,
+    pub(crate) ignores: Vec<String>,
+    pub(crate) max_file_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ClonesCmd {
-    pub paths: Vec<PathBuf>,
-    pub mode: OutputMode,
-    pub threads: Option<usize>,
-    pub top: usize,
-    pub min_sim: f64,
-    pub min_lines: u32,
-    pub min_tokens: usize,
-    pub lang: Option<String>,
-    pub tests: TestFilter,
-    pub recs: RecsMode,
-    pub ignores: Vec<String>,
-    pub max_file_bytes: usize,
+pub(crate) struct ClonesCmd {
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) mode: OutputMode,
+    pub(crate) threads: Option<usize>,
+    pub(crate) top: usize,
+    pub(crate) min_sim: f64,
+    pub(crate) min_lines: u32,
+    pub(crate) min_tokens: usize,
+    pub(crate) lang: Option<String>,
+    pub(crate) tests: TestFilter,
+    pub(crate) recs: RecsMode,
+    pub(crate) ignores: Vec<String>,
+    pub(crate) max_file_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SearchCmd {
-    pub paths: Vec<PathBuf>,
-    pub query: QuerySource,
-    pub mode: OutputMode,
-    pub threads: Option<usize>,
-    pub top: usize,
-    pub search_limit: usize,
-    pub min_sim: f64,
-    pub origin: OriginFilter,
-    pub lang: Option<String>,
-    pub ignores: Vec<String>,
-    pub max_file_bytes: usize,
+pub(crate) struct SearchCmd {
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) query: QuerySource,
+    pub(crate) mode: OutputMode,
+    pub(crate) threads: Option<usize>,
+    pub(crate) top: usize,
+    pub(crate) search_limit: usize,
+    pub(crate) min_sim: f64,
+    pub(crate) origin: OriginFilter,
+    pub(crate) lang: Option<String>,
+    pub(crate) ignores: Vec<String>,
+    pub(crate) max_file_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RecommendCmd {
-    pub paths: Vec<PathBuf>,
-    pub query: QuerySource,
-    pub mode: OutputMode,
-    pub threads: Option<usize>,
-    pub top: usize,
-    pub min_sim: f64,
-    pub min_support: usize,
-    pub search_limit: usize,
-    pub cluster_limit: usize,
-    pub origin: OriginFilter,
-    pub lang: Option<String>,
-    pub ignores: Vec<String>,
-    pub max_file_bytes: usize,
+pub(crate) struct RecommendCmd {
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) query: QuerySource,
+    pub(crate) mode: OutputMode,
+    pub(crate) threads: Option<usize>,
+    pub(crate) top: usize,
+    pub(crate) min_sim: f64,
+    pub(crate) min_support: usize,
+    pub(crate) search_limit: usize,
+    pub(crate) cluster_limit: usize,
+    pub(crate) origin: OriginFilter,
+    pub(crate) lang: Option<String>,
+    pub(crate) ignores: Vec<String>,
+    pub(crate) max_file_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BenchCmd {
-    pub manifest: PathBuf,
-    pub queries: PathBuf,
-    pub threads: Option<usize>,
+pub(crate) struct BenchCmd {
+    pub(crate) manifest: PathBuf,
+    pub(crate) queries: PathBuf,
+    pub(crate) threads: Option<usize>,
 }
 
 #[must_use]
 #[derive(Debug, Clone, PartialEq)]
-pub enum Action {
+pub(crate) enum Action {
     Help(HelpTopic),
     Version,
     Capabilities(OutputMode),
@@ -187,9 +187,9 @@ pub enum Action {
 
 #[must_use]
 #[derive(Debug, Clone, PartialEq)]
-pub struct ParsedRun {
-    pub action: Action,
-    pub notes: Vec<String>,
+pub(crate) struct ParsedRun {
+    pub(crate) action: Action,
+    pub(crate) notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,7 +274,7 @@ fn resolve_subcommand(raw: &str, notes: &mut Vec<String>) -> Option<Subcmd> {
     }
 }
 
-pub fn normalize_language(raw: &str, notes: &mut Vec<String>) -> Result<String, CliError> {
+pub(crate) fn normalize_language(raw: &str, notes: &mut Vec<String>) -> Result<String, CliError> {
     let lower = raw.to_ascii_lowercase();
     match lower.as_str() {
         "rust" | "python" | "typescript" => Ok(lower),
@@ -304,7 +304,7 @@ pub fn normalize_language(raw: &str, notes: &mut Vec<String>) -> Result<String, 
 }
 
 /// Parses 1-based line numbers, comma lists, and inclusive ranges (`10-25`) within `MAX_LINE_SPEC_COUNT`.
-pub fn parse_line_spec(spec: &str) -> Result<Vec<u32>, CliError> {
+pub(crate) fn parse_line_spec(spec: &str) -> Result<Vec<u32>, CliError> {
     if spec.trim().is_empty() {
         return Err(CliError::user_input(
             "empty --lines specification",
@@ -863,22 +863,22 @@ fn build_query_source(
             format!("aroma {subcmd} --help"),
         )),
         (None, None) => {
-            if !stdin_is_tty {
-                Ok(QuerySource::Stdin)
-            } else {
+            if stdin_is_tty {
                 Err(CliError::user_input(
                     format!("'{subcmd}' requires a query input"),
                     "Provide --snippet <CODE>, --snippet-file <FILE>, or --file <FILE> --lines <SPEC>",
                     format!("aroma {subcmd} . --snippet 'return a + b' --lang python --json"),
                     format!("aroma {subcmd} --help"),
                 ))
+            } else {
+                Ok(QuerySource::Stdin)
             }
         }
     }
 }
 
 /// Parses CLI arguments and relevant environment variables into an [`Action`].
-pub fn parse_args(
+pub(crate) fn parse_args(
     args: &[String],
     env: &[(String, String)],
     stdin_is_tty: bool,
@@ -947,25 +947,23 @@ pub fn parse_args(
                 }
             }
         } else {
-            chosen_sub = match resolve_subcommand(raw, &mut notes) {
-                Some(s) => Some(s),
-                None => {
-                    if let Some(sug) = closest_match(raw, KNOWN_SUBCOMMANDS, 2) {
-                        return Err(CliError::user_input(
-                            format!("unknown command '{raw}'"),
-                            format!("'{raw}' is not an aroma subcommand; did you mean '{sug}'?"),
-                            format!("aroma {sug} --help"),
-                            "aroma --help (or 'aroma --robot-triage .')",
-                        ));
-                    }
+            let Some(s) = resolve_subcommand(raw, &mut notes) else {
+                if let Some(sug) = closest_match(raw, KNOWN_SUBCOMMANDS, 2) {
                     return Err(CliError::user_input(
                         format!("unknown command '{raw}'"),
-                        "Expected a subcommand (triage, clones, search, recommend, capabilities, robot-docs, schema, bench)",
-                        "aroma --robot-triage .",
-                        "aroma --help",
+                        format!("'{raw}' is not an aroma subcommand; did you mean '{sug}'?"),
+                        format!("aroma {sug} --help"),
+                        "aroma --help (or 'aroma --robot-triage .')",
                     ));
                 }
+                return Err(CliError::user_input(
+                    format!("unknown command '{raw}'"),
+                    "Expected a subcommand (triage, clones, search, recommend, capabilities, robot-docs, schema, bench)",
+                    "aroma --robot-triage .",
+                    "aroma --help",
+                ));
             };
+            chosen_sub = Some(s);
             break;
         }
     }

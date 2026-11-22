@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 use aroma::{
     build_index, queries_from_lines, query_from_snippet, recommend, search, IndexOptions,
@@ -89,9 +90,10 @@ fn test_python_class_fstring_hex_methods_preserved() {
         "    def _repr_info(self):\n        info = [f'overlapped=<{self.state}, {self._ov:#x}>']\n        return info\n\n",
     );
     for i in 0..20 {
-        py.push_str(&format!(
+        let _ = write!(
+            py,
             "    def method_{i}(self, val):\n        res = self._check(val + {i})\n        return res\n\n"
-        ));
+        );
     }
 
     let files = vec![SourceFile { path: "win_events.py".into(), source: py }];

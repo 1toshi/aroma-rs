@@ -1,6 +1,7 @@
 //! Command execution shell (`triage`, `clones`, `search`, `recommend`, `bench`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::fs;
 use std::hint::black_box;
 use std::io::Read;
@@ -27,10 +28,10 @@ use crate::cli::walk::{
 };
 
 #[must_use]
-pub struct CommandOutcome {
-    pub exit: ExitKind,
-    pub stdout: String,
-    pub stderr_notes: Vec<String>,
+pub(crate) struct CommandOutcome {
+    pub(crate) exit: ExitKind,
+    pub(crate) stdout: String,
+    pub(crate) stderr_notes: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -158,13 +159,13 @@ impl UnionFind {
         if ra == rb {
             return;
         }
-        if self.rank[ra] < self.rank[rb] {
-            self.parent[ra] = rb;
-        } else if self.rank[ra] > self.rank[rb] {
-            self.parent[rb] = ra;
-        } else {
-            self.parent[rb] = ra;
-            self.rank[ra] += 1;
+        match self.rank[ra].cmp(&self.rank[rb]) {
+            std::cmp::Ordering::Less => self.parent[ra] = rb,
+            std::cmp::Ordering::Greater => self.parent[rb] = ra,
+            std::cmp::Ordering::Equal => {
+                self.parent[rb] = ra;
+                self.rank[ra] += 1;
+            }
         }
     }
 }
@@ -206,7 +207,7 @@ fn line_count_for(src: &str) -> u32 {
     if src.is_empty() {
         return 0;
     }
-    let newlines = src.as_bytes().iter().filter(|&&b| b == b'\n').count() as u32;
+    let newlines = memchr::memchr_iter(b'\n', src.as_bytes()).count() as u32;
     if src.ends_with('\n') {
         newlines.max(1)
     } else {
@@ -254,10 +255,10 @@ fn make_code_preview(lines: &[aroma::RecommendedLine]) -> String {
             LineRole::Added => ' ',
             LineRole::Structure => '.',
         };
-        out.push_str(&format!("{:4} {} {}", line.line, mark, line.text));
+        let _ = write!(out, "{:4} {} {}", line.line, mark, line.text);
     }
     if lines.len() > 12 {
-        out.push_str(&format!("\n... ({} more lines)", lines.len() - 12));
+        let _ = write!(out, "\n... ({} more lines)", lines.len() - 12);
     }
     out
 }
@@ -280,12 +281,6 @@ struct CloneParams {
 }
 
 fn analyze_clones(walk: &WalkResult, index: &AromaIndex, params: &CloneParams) -> CloneAnalysis {
-    let canonical_set: FxHashSet<(String, u32, u32, String)> = index
-        .method_refs()
-        .into_iter()
-        .map(|r| (r.path, r.start_line, r.end_line, r.name))
-        .collect();
-
     struct RawMethod {
         path: String,
         name: String,
@@ -298,6 +293,19 @@ fn analyze_clones(walk: &WalkResult, index: &AromaIndex, params: &CloneParams) -
         is_canonical: bool,
         query: Query,
     }
+    struct PairAccum {
+        lines: u32,
+        sim_sum: f64,
+        exact_cnt: usize,
+        near_cnt: usize,
+        methods: BTreeSet<String>,
+    }
+
+    let canonical_set: FxHashSet<(String, u32, u32, String)> = index
+        .method_refs()
+        .into_iter()
+        .map(|r| (r.path, r.start_line, r.end_line, r.name))
+        .collect();
 
     let extract_one = |sf: &SourceFile| -> Vec<RawMethod> {
         let test_flag = is_test_path(&sf.path);
@@ -502,9 +510,8 @@ fn analyze_clones(walk: &WalkResult, index: &AromaIndex, params: &CloneParams) -
     let mut hotspot_acc: BTreeMap<String, (u32, usize, usize)> = BTreeMap::new();
 
     for r in roots {
-        let mut mems = match comp_members.remove(&r) {
-            Some(v) => v,
-            None => continue,
+        let Some(mut mems) = comp_members.remove(&r) else {
+            continue;
         };
         if mems.len() < 2 {
             continue;
@@ -616,13 +623,6 @@ fn analyze_clones(walk: &WalkResult, index: &AromaIndex, params: &CloneParams) -
     }
 
     // Aggregate distinct file pairs
-    struct PairAccum {
-        lines: u32,
-        sim_sum: f64,
-        exact_cnt: usize,
-        near_cnt: usize,
-        methods: BTreeSet<String>,
-    }
     let mut pair_acc: BTreeMap<(String, String), PairAccum> = BTreeMap::new();
     for e in &edges {
         let mu = &methods[e.u];
@@ -725,7 +725,7 @@ fn format_path_args(paths: &[PathBuf]) -> String {
     }
 }
 
-pub fn run_triage(cmd: &TriageCmd) -> Result<CommandOutcome, CliError> {
+pub(crate) fn run_triage(cmd: &TriageCmd) -> Result<CommandOutcome, CliError> {
     let walk = walk_paths(
         &cmd.paths,
         &WalkOptions {
@@ -802,14 +802,12 @@ pub fn run_triage(cmd: &TriageCmd) -> Result<CommandOutcome, CliError> {
         exact_total,
         cmd.min_sim
     );
-    let hint = if analysis.total_clusters == 0 {
-        Some(format!(
+    let hint = (analysis.total_clusters == 0).then(|| {
+        format!(
             "No clones found at --min-sim {:.2}; try lowering threshold via `aroma triage {path_str} --min-sim 0.65 --include-tests --json`",
             cmd.min_sim
-        ))
-    } else {
-        None
-    };
+        )
+    });
 
     let stdout = match cmd.mode {
         OutputMode::Json => {
@@ -854,7 +852,7 @@ pub fn run_triage(cmd: &TriageCmd) -> Result<CommandOutcome, CliError> {
             let mut txt = format!("Aroma Triage ({summary})\ndata_hash: {}\n", walk.data_hash);
             if analysis.clusters.is_empty() {
                 if let Some(ref h) = hint {
-                    txt.push_str(&format!("\nhint: {h}\n"));
+                    let _ = writeln!(txt, "\nhint: {h}");
                 }
             } else {
                 txt.push_str("\nTop Clone Clusters:\n");
@@ -865,8 +863,9 @@ pub fn run_triage(cmd: &TriageCmd) -> Result<CommandOutcome, CliError> {
                         .take(3)
                         .map(|m| format!("{}:{}-{} `{}`", m.path, m.start_line, m.end_line, m.name))
                         .collect();
-                    txt.push_str(&format!(
-                        "  #{} [{} {}] score={:.1} dupL={} sim={:.3} | {}\n",
+                    let _ = writeln!(
+                        txt,
+                        "  #{} [{} {}] score={:.1} dupL={} sim={:.3} | {}",
                         c.cluster_id,
                         c.language,
                         c.kind,
@@ -874,7 +873,7 @@ pub fn run_triage(cmd: &TriageCmd) -> Result<CommandOutcome, CliError> {
                         c.duplicated_lines,
                         c.avg_sim,
                         members.join(" ; ")
-                    ));
+                    );
                 }
             }
             txt
@@ -888,7 +887,7 @@ pub fn run_triage(cmd: &TriageCmd) -> Result<CommandOutcome, CliError> {
     })
 }
 
-pub fn run_clones(cmd: &ClonesCmd) -> Result<CommandOutcome, CliError> {
+pub(crate) fn run_clones(cmd: &ClonesCmd) -> Result<CommandOutcome, CliError> {
     let walk = walk_paths(
         &cmd.paths,
         &WalkOptions {
@@ -936,14 +935,12 @@ pub fn run_clones(cmd: &ClonesCmd) -> Result<CommandOutcome, CliError> {
             destructive: false,
         });
     }
-    let hint = if analysis.total_clusters == 0 {
-        Some(format!(
+    let hint = (analysis.total_clusters == 0).then(|| {
+        format!(
             "No clones found at --min-sim {:.2}; try `aroma clones {path_str} --min-sim 0.65 --include-tests --json`",
             cmd.min_sim
-        ))
-    } else {
-        None
-    };
+        )
+    });
 
     let stdout = match cmd.mode {
         OutputMode::Json => {
@@ -987,7 +984,7 @@ pub fn run_clones(cmd: &ClonesCmd) -> Result<CommandOutcome, CliError> {
             );
             if analysis.clusters.is_empty() {
                 if let Some(ref h) = hint {
-                    txt.push_str(&format!("hint: {h}\n"));
+                    let _ = writeln!(txt, "hint: {h}");
                 }
             } else {
                 for c in &analysis.clusters {
@@ -997,8 +994,9 @@ pub fn run_clones(cmd: &ClonesCmd) -> Result<CommandOutcome, CliError> {
                         .take(4)
                         .map(|m| format!("{}:{}-{} `{}`", m.path, m.start_line, m.end_line, m.name))
                         .collect();
-                    txt.push_str(&format!(
-                        "#{} [{} {}] score={:.1} dupL={} sim={:.3} | {}\n",
+                    let _ = writeln!(
+                        txt,
+                        "#{} [{} {}] score={:.1} dupL={} sim={:.3} | {}",
                         c.cluster_id,
                         c.language,
                         c.kind,
@@ -1006,7 +1004,7 @@ pub fn run_clones(cmd: &ClonesCmd) -> Result<CommandOutcome, CliError> {
                         c.duplicated_lines,
                         c.avg_sim,
                         ms.join(" ; ")
-                    ));
+                    );
                 }
             }
             txt
@@ -1130,7 +1128,7 @@ fn resolve_query(
     walk: &WalkResult,
     index: &AromaIndex,
     source: &QuerySource,
-    explicit_lang: &Option<String>,
+    explicit_lang: Option<&str>,
     subcmd: &str,
 ) -> Result<ResolvedQuery, CliError> {
     let mut notes = Vec::new();
@@ -1141,20 +1139,18 @@ fn resolve_query(
             let idx = resolve_indexed_file_idx(walk, file)?;
             let sf = &walk.files[idx];
             let qs = queries_from_lines(index, sf, lines);
-            let chosen = qs.into_iter().max_by_key(|q| q.size());
+            let chosen = qs.into_iter().max_by_key(Query::size);
             let lang = infer_language_for_path(&sf.path)
                 .unwrap_or("rust")
                 .to_string();
-            let empty_hint = if chosen.is_none() {
-                Some(format!(
+            let empty_hint = chosen.is_none().then(|| {
+                format!(
                     "No indexed method overlapped lines {:?} in '{}'; check line span or inspect via `aroma triage {} --json`",
                     lines,
                     sf.path,
                     shell_quote(&sf.path)
-                ))
-            } else {
-                None
-            };
+                )
+            });
             let meta = QueryMetaOut {
                 source_kind: "file_lines".to_string(),
                 language: chosen
@@ -1240,7 +1236,7 @@ fn resolve_query(
 struct SnippetQueryCtx<'a> {
     walk: &'a WalkResult,
     index: &'a AromaIndex,
-    explicit_lang: &'a Option<String>,
+    explicit_lang: Option<&'a str>,
     subcmd: &'a str,
 }
 
@@ -1262,7 +1258,7 @@ fn resolve_snippet_query(
 
     let path_str = snippet_path.map(|p| p.to_string_lossy().to_string());
     let inferred = if let Some(l) = ctx.explicit_lang {
-        l.clone()
+        l.to_string()
     } else if let Some(ref ps) = path_str {
         if let Some(l) = infer_language_for_path(ps) {
             notes.push(format!("note: inferred --lang {l} from --snippet-file '{ps}'"));
@@ -1312,13 +1308,11 @@ fn resolve_snippet_query(
             globals: None,
         },
     );
-    let empty_hint = if q.is_none() {
-        Some(format!(
+    let empty_hint = q.is_none().then(|| {
+        format!(
             "Snippet did not match any indexed {inferred} structural features; try a longer code block or pass a different --lang"
-        ))
-    } else {
-        None
-    };
+        )
+    });
     let meta = QueryMetaOut {
         source_kind: if snippet_path.is_some() {
             "snippet_file".to_string()
@@ -1340,7 +1334,7 @@ fn resolve_snippet_query(
 
 fn missing_lang_error(walk: &WalkResult, subcmd: &str) -> CliError {
     let langs: Vec<String> = walk.language_counts.keys().cloned().collect();
-    let sample = langs.first().map(String::as_str).unwrap_or("rust");
+    let sample = langs.first().map_or("rust", String::as_str);
     CliError::user_input(
         format!("cannot infer snippet language across multi-language corpus ({})", langs.join(", ")),
         "Pass --lang when indexing multiple languages so Aroma parses the snippet with the matching grammar",
@@ -1367,7 +1361,7 @@ struct QueryRunCtx {
     path_str: String,
 }
 
-fn prepare_query_run(spec: QueryRunSpec<'_>) -> Result<QueryRunCtx, CliError> {
+fn prepare_query_run(spec: &QueryRunSpec<'_>) -> Result<QueryRunCtx, CliError> {
     let walk = walk_paths(
         spec.paths,
         &WalkOptions {
@@ -1385,7 +1379,7 @@ fn prepare_query_run(spec: QueryRunSpec<'_>) -> Result<QueryRunCtx, CliError> {
         },
     );
     let corpus = corpus_summary(&walk, &index);
-    let resolved = resolve_query(&walk, &index, spec.query, spec.lang, spec.subcmd)?;
+    let resolved = resolve_query(&walk, &index, spec.query, spec.lang.as_deref(), spec.subcmd)?;
     let path_str = format_path_args(spec.paths);
     Ok(QueryRunCtx { walk, index, corpus, resolved, path_str })
 }
@@ -1438,17 +1432,7 @@ fn render_query_json<P: Serialize>(
     serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
 }
 
-pub fn run_search(cmd: &SearchCmd) -> Result<CommandOutcome, CliError> {
-    let mut ctx = prepare_query_run(QueryRunSpec {
-        paths: &cmd.paths,
-        max_file_bytes: cmd.max_file_bytes,
-        ignores: &cmd.ignores,
-        lang: &cmd.lang,
-        threads: cmd.threads,
-        query: &cmd.query,
-        subcmd: "search",
-    })?;
-
+pub(crate) fn run_search(cmd: &SearchCmd) -> Result<CommandOutcome, CliError> {
     #[derive(Serialize)]
     struct HitOut {
         method: MethodRefOut,
@@ -1459,6 +1443,16 @@ pub fn run_search(cmd: &SearchCmd) -> Result<CommandOutcome, CliError> {
     struct HitsPayload<'a> {
         hits: &'a [HitOut],
     }
+
+    let mut ctx = prepare_query_run(&QueryRunSpec {
+        paths: &cmd.paths,
+        max_file_bytes: cmd.max_file_bytes,
+        ignores: &cmd.ignores,
+        lang: &cmd.lang,
+        threads: cmd.threads,
+        query: &cmd.query,
+        subcmd: "search",
+    })?;
 
     let mut hits_out: Vec<HitOut> = Vec::new();
     if let Some(ref q) = ctx.resolved.query {
@@ -1517,11 +1511,12 @@ pub fn run_search(cmd: &SearchCmd) -> Result<CommandOutcome, CliError> {
                 ctx.resolved.meta.size
             );
             if let Some(ref h) = hint {
-                txt.push_str(&format!("hint: {h}\n"));
+                let _ = writeln!(txt, "hint: {h}");
             }
             for (i, hit) in hits_out.iter().enumerate() {
-                txt.push_str(&format!(
-                    "  {}. sim={:.3} {}:{}-{} `{}` (matched_lines={:?})\n",
+                let _ = writeln!(
+                    txt,
+                    "  {}. sim={:.3} {}:{}-{} `{}` (matched_lines={:?})",
                     i + 1,
                     hit.similarity,
                     hit.method.path,
@@ -1529,7 +1524,7 @@ pub fn run_search(cmd: &SearchCmd) -> Result<CommandOutcome, CliError> {
                     hit.method.end_line,
                     hit.method.name,
                     hit.matched_lines
-                ));
+                );
             }
             txt
         }
@@ -1542,17 +1537,7 @@ pub fn run_search(cmd: &SearchCmd) -> Result<CommandOutcome, CliError> {
     })
 }
 
-pub fn run_recommend(cmd: &RecommendCmd) -> Result<CommandOutcome, CliError> {
-    let mut ctx = prepare_query_run(QueryRunSpec {
-        paths: &cmd.paths,
-        max_file_bytes: cmd.max_file_bytes,
-        ignores: &cmd.ignores,
-        lang: &cmd.lang,
-        threads: cmd.threads,
-        query: &cmd.query,
-        subcmd: "recommend",
-    })?;
-
+pub(crate) fn run_recommend(cmd: &RecommendCmd) -> Result<CommandOutcome, CliError> {
     #[derive(Serialize)]
     struct LineOut {
         line: u32,
@@ -1572,6 +1557,16 @@ pub fn run_recommend(cmd: &RecommendCmd) -> Result<CommandOutcome, CliError> {
     struct RecsPayload<'a> {
         recommendations: &'a [RecOut],
     }
+
+    let mut ctx = prepare_query_run(&QueryRunSpec {
+        paths: &cmd.paths,
+        max_file_bytes: cmd.max_file_bytes,
+        ignores: &cmd.ignores,
+        lang: &cmd.lang,
+        threads: cmd.threads,
+        query: &cmd.query,
+        subcmd: "recommend",
+    })?;
 
     let mut recs_out: Vec<RecOut> = Vec::new();
     if let Some(ref q) = ctx.resolved.query {
@@ -1649,11 +1644,12 @@ pub fn run_recommend(cmd: &RecommendCmd) -> Result<CommandOutcome, CliError> {
                 ctx.resolved.meta.size
             );
             if let Some(ref h) = hint {
-                txt.push_str(&format!("hint: {h}\n"));
+                let _ = writeln!(txt, "hint: {h}");
             }
             for (i, r) in recs_out.iter().enumerate() {
-                txt.push_str(&format!(
-                    "\n--- Recommendation #{} (sim={:.3}, members={}) {}:{} `{}` ---\n{}\n",
+                let _ = writeln!(
+                    txt,
+                    "\n--- Recommendation #{} (sim={:.3}, members={}) {}:{} `{}` ---\n{}",
                     i + 1,
                     r.similarity,
                     r.member_count,
@@ -1661,7 +1657,7 @@ pub fn run_recommend(cmd: &RecommendCmd) -> Result<CommandOutcome, CliError> {
                     r.method.start_line,
                     r.method.name,
                     r.code
-                ));
+                );
             }
             txt
         }
@@ -1674,7 +1670,7 @@ pub fn run_recommend(cmd: &RecommendCmd) -> Result<CommandOutcome, CliError> {
     })
 }
 
-pub fn run_bench(cmd: &BenchCmd) -> Result<CommandOutcome, CliError> {
+pub(crate) fn run_bench(cmd: &BenchCmd) -> Result<CommandOutcome, CliError> {
     #[derive(Deserialize)]
     struct ManifestEntry {
         path: String,
@@ -1772,7 +1768,7 @@ pub fn run_bench(cmd: &BenchCmd) -> Result<CommandOutcome, CliError> {
 
     let threads_used = cmd
         .threads
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
         .max(1);
 
     let t0 = Instant::now();
@@ -1834,8 +1830,7 @@ pub fn run_bench(cmd: &BenchCmd) -> Result<CommandOutcome, CliError> {
             total_search_hits += s_res.len();
             if s_res
                 .first()
-                .map(|r| r.method.path == spec.path && r.method.start_line == spec.start_line)
-                == Some(true)
+                .is_some_and(|r| r.method.path == spec.path && r.method.start_line == spec.start_line)
             {
                 recall_hits += 1;
             }
@@ -1895,8 +1890,8 @@ pub fn run_bench(cmd: &BenchCmd) -> Result<CommandOutcome, CliError> {
 
     let search_total_ms = search_us.iter().sum::<f64>() / 1000.0;
     let recommend_total_ms = recommend_us.iter().sum::<f64>() / 1000.0;
-    search_us.sort_by(|a, b| a.total_cmp(b));
-    recommend_us.sort_by(|a, b| a.total_cmp(b));
+    search_us.sort_by(f64::total_cmp);
+    recommend_us.sort_by(f64::total_cmp);
 
     let st = index.stats();
     let out = BenchOutput {

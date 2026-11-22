@@ -10,7 +10,7 @@ repository = "https://github.com/moorbrook/aroma-rs"
 documentation = "https://docs.rs/aroma-rs"
 keywords = ["code-search", "clone-detection", "ast", "aroma", "static-analysis"]
 categories = ["development-tools", "command-line-utilities", "text-processing"]
-exclude = [".cargo/**", ".local/**", "ARENA_SYNTHESIS.md", "agent_ergonomics_audit/**", "rust-toolchain.toml"]
+exclude = [".cargo/**", ".claude/**", ".local/**", "ARENA_SYNTHESIS.md", "agent_ergonomics_audit/**", "rust-toolchain.toml"]
 
 [lib]
 name = "aroma"
@@ -43,3 +43,19 @@ debug = false
 
 [profile.test]
 opt-level = 3
+
+[lints.rust]
+unused_qualifications = "warn"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+clone_on_ref_ptr = "warn"
+format_push_string = "warn"
+mem_forget = "warn"
+rc_buffer = "warn"
+rc_mutex = "warn"
+try_err = "warn"
+unnecessary_self_imports = "warn"
+verbose_file_reads = "warn"

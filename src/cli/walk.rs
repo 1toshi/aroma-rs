@@ -11,7 +11,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::cli::error::CliError;
 
-pub const DEFAULT_IGNORES: &[&str] = &[
+pub(crate) const DEFAULT_IGNORES: &[&str] = &[
     ".git",
     "target",
     "node_modules",
@@ -34,33 +34,33 @@ pub const DEFAULT_IGNORES: &[&str] = &[
 const IGNORED_SUFFIXES: &[&str] = &[".min.js", ".min.mjs", ".bundle.js", ".d.ts"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WalkOptions {
-    pub max_file_bytes: usize,
-    pub extra_ignores: Vec<String>,
-    pub lang_filter: Option<String>,
+pub(crate) struct WalkOptions {
+    pub(crate) max_file_bytes: usize,
+    pub(crate) extra_ignores: Vec<String>,
+    pub(crate) lang_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct WarningItem {
-    pub code: String,
-    pub message: String,
+pub(crate) struct WarningItem {
+    pub(crate) code: String,
+    pub(crate) message: String,
 }
 
 #[must_use]
 #[derive(Debug, Clone)]
-pub struct WalkResult {
-    pub files: Vec<SourceFile>,
-    pub fs_paths: Vec<PathBuf>,
-    pub data_hash: String,
-    pub language_counts: BTreeMap<String, usize>,
-    pub total_bytes: usize,
-    pub skipped_oversized: usize,
-    pub skipped_non_utf8: usize,
-    pub skipped_unsupported: usize,
-    pub warnings: Vec<WarningItem>,
+pub(crate) struct WalkResult {
+    pub(crate) files: Vec<SourceFile>,
+    pub(crate) fs_paths: Vec<PathBuf>,
+    pub(crate) data_hash: String,
+    pub(crate) language_counts: BTreeMap<String, usize>,
+    pub(crate) total_bytes: usize,
+    pub(crate) skipped_oversized: usize,
+    pub(crate) skipped_non_utf8: usize,
+    pub(crate) skipped_unsupported: usize,
+    pub(crate) warnings: Vec<WarningItem>,
 }
 
-pub fn normalize_display_path(path: &Path) -> String {
+pub(crate) fn normalize_display_path(path: &Path) -> String {
     let raw = path.to_string_lossy().replace('\\', "/");
     let stripped = raw.strip_prefix("./").unwrap_or(&raw);
     if stripped.is_empty() {
@@ -70,17 +70,15 @@ pub fn normalize_display_path(path: &Path) -> String {
     }
 }
 
-pub fn infer_language_for_path(path: &str) -> Option<&'static str> {
-    let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".rs") {
+pub(crate) fn infer_language_for_path(path: &str) -> Option<&'static str> {
+    let ext = Path::new(path).extension().and_then(|e| e.to_str())?;
+    if ext.eq_ignore_ascii_case("rs") {
         Some("rust")
-    } else if lower.ends_with(".py") {
+    } else if ext.eq_ignore_ascii_case("py") {
         Some("python")
-    } else if [
-        ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs",
-    ]
-    .iter()
-    .any(|ext| lower.ends_with(ext))
+    } else if ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"]
+        .iter()
+        .any(|cand| ext.eq_ignore_ascii_case(cand))
     {
         Some("typescript")
     } else {
@@ -88,7 +86,7 @@ pub fn infer_language_for_path(path: &str) -> Option<&'static str> {
     }
 }
 
-pub fn is_test_path(path: &str) -> bool {
+pub(crate) fn is_test_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let filename = lower.rsplit('/').next().unwrap_or(&lower);
     lower.contains("/test/")
@@ -151,9 +149,8 @@ fn collect_dir(
         if is_ignored_name(fname, ignore_set) {
             continue;
         }
-        let meta = match fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
         };
         if meta.file_type().is_symlink() {
             continue;
@@ -189,7 +186,7 @@ fn collect_dir(
 }
 
 /// Reads up to `cap` bytes safely using `Read::take(cap + 1)`. Returns `Ok(None)` if over cap.
-pub fn read_file_bounded(path: &Path, cap: usize) -> Result<Option<Vec<u8>>, CliError> {
+pub(crate) fn read_file_bounded(path: &Path, cap: usize) -> Result<Option<Vec<u8>>, CliError> {
     let meta = fs::metadata(path).map_err(|e| {
         CliError::tool_env(
             format!("cannot stat file '{}': {e}", path.display()),
@@ -226,7 +223,7 @@ pub fn read_file_bounded(path: &Path, cap: usize) -> Result<Option<Vec<u8>>, Cli
 }
 
 /// Walks files/directories deterministically, reading bounded UTF-8 supported source files.
-pub fn walk_paths(paths: &[PathBuf], opts: &WalkOptions) -> Result<WalkResult, CliError> {
+pub(crate) fn walk_paths(paths: &[PathBuf], opts: &WalkOptions) -> Result<WalkResult, CliError> {
     let default_paths = [PathBuf::from(".")];
     let roots: &[PathBuf] = if paths.is_empty() { &default_paths } else { paths };
 
@@ -305,19 +302,13 @@ pub fn walk_paths(paths: &[PathBuf], opts: &WalkOptions) -> Result<WalkResult, C
     let mut hasher = Xxh3::new();
 
     for (disp, full) in candidates {
-        let bytes = match read_file_bounded(&full, opts.max_file_bytes)? {
-            Some(b) => b,
-            None => {
-                skipped_oversized += 1;
-                continue;
-            }
+        let Some(bytes) = read_file_bounded(&full, opts.max_file_bytes)? else {
+            skipped_oversized += 1;
+            continue;
         };
-        let source = match String::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(_) => {
-                skipped_non_utf8 += 1;
-                continue;
-            }
+        let Ok(source) = String::from_utf8(bytes) else {
+            skipped_non_utf8 += 1;
+            continue;
         };
         if let Some(lang) = infer_language_for_path(&disp) {
             *language_counts.entry(lang.to_string()).or_insert(0) += 1;

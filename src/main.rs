@@ -1,4 +1,20 @@
 #[cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#[warn(unreachable_pub, clippy::pedantic)]
+// CLI helper bounds/casts and flag structs legitimately trip pedantic noise lints.
+#[allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::module_name_repetitions,
+    clippy::must_use_candidate,
+    clippy::similar_names,
+    clippy::struct_excessive_bools,
+    clippy::too_many_lines
+)]
 mod cli;
 
 use std::io::IsTerminal;

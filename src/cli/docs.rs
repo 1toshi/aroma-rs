@@ -10,11 +10,11 @@ use crate::cli::args::{
 use crate::cli::error::ExitKind;
 use crate::cli::walk::DEFAULT_IGNORES;
 
-pub fn version_string() -> String {
+pub(crate) fn version_string() -> String {
     format!("aroma {} ({})", env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_NAME"))
 }
 
-pub fn render_help(topic: HelpTopic) -> String {
+pub(crate) fn render_help(topic: HelpTopic) -> String {
     match topic {
         HelpTopic::Root => format!(
             "\
@@ -189,7 +189,7 @@ OPTIONS:
     }
 }
 
-pub fn capabilities_json() -> Value {
+pub(crate) fn capabilities_json() -> Value {
     let mut exit_codes = serde_json::Map::new();
     for kind in ExitKind::ALL {
         exit_codes.insert(
@@ -370,7 +370,7 @@ pub fn capabilities_json() -> Value {
     })
 }
 
-pub fn render_capabilities(mode: OutputMode) -> String {
+pub(crate) fn render_capabilities(mode: OutputMode) -> String {
     match mode {
         OutputMode::Json => {
             serde_json::to_string_pretty(&capabilities_json()).unwrap_or_else(|_| "{}".to_string())
@@ -401,7 +401,7 @@ Machine contract: aroma capabilities --json
     }
 }
 
-pub fn render_robot_docs(_topic: DocsTopic) -> String {
+pub(crate) fn render_robot_docs(_topic: DocsTopic) -> String {
     "\
 # aroma Agent Handbook (`aroma robot-docs guide`)
 
@@ -540,7 +540,7 @@ fn schema_for_one(cmd: SchemaCommand) -> Value {
     }
 }
 
-pub fn render_schema(command: Option<SchemaCommand>, _mode: OutputMode) -> String {
+pub(crate) fn render_schema(command: Option<SchemaCommand>, _mode: OutputMode) -> String {
     let val = match command {
         Some(c) => schema_for_one(c),
         None => json!({
