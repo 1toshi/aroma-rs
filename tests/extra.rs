@@ -429,3 +429,39 @@ fn test_parallel_rayon_search_and_recommend_reentrancy() {
     assert!(!filtered.is_empty());
     assert!(filtered.iter().all(|r| r.method.path != "f_11.rs"));
 }
+
+#[test]
+fn test_recommend_min_support_one_does_not_panic() {
+    let files = vec![SourceFile {
+        path: "single.rs".into(),
+        source: concat!(
+            "pub fn aggregate_positives(xs: &[i32], factor: i32) -> i32 {\n",
+            "    let mut total = 0;\n",
+            "    let mut count = 0;\n",
+            "    for &x in xs {\n",
+            "        if x > 0 {\n",
+            "            total += x * factor;\n",
+            "            count += 1;\n",
+            "        }\n",
+            "    }\n",
+            "    if count > 0 { total / count } else { 0 }\n",
+            "}\n",
+        )
+        .into(),
+    }];
+    let idx = build_index(&files, IndexOptions { threads: Some(1), ..Default::default() });
+    let qs = queries_from_lines(&idx, &files[0], &[2, 3]);
+    assert_eq!(qs.len(), 1);
+    let q_no_orig = qs[0].without_origin();
+    let recs = recommend(
+        &idx,
+        &q_no_orig,
+        &RecommendOptions {
+            min_support: 1,
+            ..Default::default()
+        },
+    );
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].members.len(), 1);
+    assert_eq!(recs[0].method.name, "aggregate_positives");
+}

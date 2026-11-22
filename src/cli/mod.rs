@@ -1,10 +1,10 @@
 //! Modular CLI shell (`args` pure core + `docs` + `walk` + `commands`).
 
-pub mod args;
-pub mod commands;
-pub mod docs;
-pub mod error;
-pub mod walk;
+pub(crate) mod args;
+pub(crate) mod commands;
+pub(crate) mod docs;
+pub(crate) mod error;
+pub(crate) mod walk;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -12,9 +12,9 @@ use std::process::ExitCode;
 use args::{parse_args, Action};
 use commands::{run_bench, run_clones, run_recommend, run_search, run_triage, CommandOutcome};
 use docs::{render_capabilities, render_help, render_robot_docs, render_schema, version_string};
-use error::ExitKind;
+use error::{CliError, ExitKind};
 
-pub fn run(args: &[String], env: &[(String, String)], stdin_is_tty: bool) -> ExitCode {
+pub(crate) fn run(args: &[String], env: &[(String, String)], stdin_is_tty: bool) -> ExitCode {
     let parsed = match parse_args(args, env, stdin_is_tty) {
         Ok(p) => p,
         Err(err) => {
@@ -27,67 +27,33 @@ pub fn run(args: &[String], env: &[(String, String)], stdin_is_tty: bool) -> Exi
         let _ = writeln!(std::io::stderr(), "{note}");
     }
 
-    let outcome: CommandOutcome = match parsed.action {
-        Action::Help(topic) => CommandOutcome {
+    let static_outcome = |stdout: String| {
+        Ok(CommandOutcome {
             exit: ExitKind::Success,
-            stdout: render_help(topic),
+            stdout,
             stderr_notes: Vec::new(),
-        },
-        Action::Version => CommandOutcome {
-            exit: ExitKind::Success,
-            stdout: version_string(),
-            stderr_notes: Vec::new(),
-        },
-        Action::Capabilities(mode) => CommandOutcome {
-            exit: ExitKind::Success,
-            stdout: render_capabilities(mode),
-            stderr_notes: Vec::new(),
-        },
-        Action::RobotDocs(topic) => CommandOutcome {
-            exit: ExitKind::Success,
-            stdout: render_robot_docs(topic),
-            stderr_notes: Vec::new(),
-        },
-        Action::Schema { command, mode } => CommandOutcome {
-            exit: ExitKind::Success,
-            stdout: render_schema(command, mode),
-            stderr_notes: Vec::new(),
-        },
-        Action::Triage(cmd) => match run_triage(&cmd) {
-            Ok(out) => out,
-            Err(err) => {
-                let _ = std::io::stderr().write_all(err.render().as_bytes());
-                return err.kind.exit_code();
-            }
-        },
-        Action::Clones(cmd) => match run_clones(&cmd) {
-            Ok(out) => out,
-            Err(err) => {
-                let _ = std::io::stderr().write_all(err.render().as_bytes());
-                return err.kind.exit_code();
-            }
-        },
-        Action::Search(cmd) => match run_search(&cmd) {
-            Ok(out) => out,
-            Err(err) => {
-                let _ = std::io::stderr().write_all(err.render().as_bytes());
-                return err.kind.exit_code();
-            }
-        },
-        Action::Recommend(cmd) => match run_recommend(&cmd) {
-            Ok(out) => out,
-            Err(err) => {
-                let _ = std::io::stderr().write_all(err.render().as_bytes());
-                return err.kind.exit_code();
-            }
-        },
-        Action::Bench(cmd) => match run_bench(&cmd) {
-            Ok(out) => out,
-            Err(err) => {
-                let _ = std::io::stderr().write_all(err.render().as_bytes());
-                return err.kind.exit_code();
-            }
-        },
+        })
+    };
+
+    let res: Result<CommandOutcome, CliError> = match parsed.action {
+        Action::Help(topic) => static_outcome(render_help(topic)),
+        Action::Version => static_outcome(version_string()),
+        Action::Capabilities(mode) => static_outcome(render_capabilities(mode)),
+        Action::RobotDocs(topic) => static_outcome(render_robot_docs(topic)),
+        Action::Schema { command, mode } => static_outcome(render_schema(command, mode)),
+        Action::Triage(cmd) => run_triage(&cmd),
+        Action::Clones(cmd) => run_clones(&cmd),
+        Action::Search(cmd) => run_search(&cmd),
+        Action::Recommend(cmd) => run_recommend(&cmd),
+        Action::Bench(cmd) => run_bench(&cmd),
+    };
+
+    let outcome = match res {
+        Ok(out) => out,
+        Err(err) => {
+            let _ = std::io::stderr().write_all(err.render().as_bytes());
+            return err.kind.exit_code();
+        }
     };
 
     for note in &outcome.stderr_notes {

@@ -296,6 +296,27 @@ fn search_and_recommend_modes_and_empty_results() {
     assert!(rv["total"].as_u64().unwrap_or(0) >= 1);
     assert!(rv["recommendations"][0]["code"].as_str().is_some_and(|c| !c.is_empty()));
 
+    // 4b. Recommend with --min-support 1 against single-method Python fixture must not panic
+    let rec_single = run_aroma(
+        &[
+            "recommend",
+            root,
+            "--snippet",
+            "total = 0",
+            "--lang",
+            "python",
+            "--min-support",
+            "1",
+            "--json",
+        ],
+        &[],
+        None,
+    );
+    assert_eq!(rec_single.status.code(), Some(0));
+    let rsv: Value = serde_json::from_slice(&rec_single.stdout).expect("recommend single json");
+    assert!(rsv["total"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(rsv["recommendations"][0]["member_count"], 1);
+
     // 5. Zero-match query exits 0 with empty array and helpful hint
     let empty = run_aroma(
         &[

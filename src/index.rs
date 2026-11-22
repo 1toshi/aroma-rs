@@ -412,14 +412,17 @@ pub struct Query {
 }
 
 impl Query {
+    #[must_use]
     pub fn language(&self) -> &str {
         &self.language
     }
 
+    #[must_use]
     pub fn size(&self) -> usize {
         self.size
     }
 
+    #[must_use]
     pub fn origin(&self) -> Option<&MethodRef> {
         self.origin.as_ref()
     }
@@ -428,12 +431,14 @@ impl Query {
         self.lines.as_deref()
     }
 
+    #[must_use]
     pub fn without_origin(&self) -> Query {
         let mut q = self.clone();
         q.origin = None;
         q
     }
 
+    #[must_use]
     pub fn with_language(&self, language: &str) -> Query {
         let mut q = self.clone();
         q.language = language.to_string();
@@ -623,7 +628,7 @@ fn build_inverted_single(lidx: &mut LanguageIndex, feature_count: usize) {
                             }
                             overflow.insert((f, mid_u32), COUNT_OVERFLOW);
                         } else {
-                            *overflow.get_mut(&(f, mid_u32)).unwrap() += 1;
+                            *overflow.entry((f, mid_u32)).or_insert(COUNT_OVERFLOW) += 1;
                         }
                     }
                 }
@@ -679,7 +684,7 @@ fn build_inverted_single(lidx: &mut LanguageIndex, feature_count: usize) {
                         }
                         overflow.insert((f, mid_u32), COUNT_OVERFLOW);
                     } else {
-                        *overflow.get_mut(&(f, mid_u32)).unwrap() += 1;
+                        *overflow.entry((f, mid_u32)).or_insert(COUNT_OVERFLOW) += 1;
                     }
                 }
             }

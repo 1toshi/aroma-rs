@@ -391,7 +391,7 @@ fn intersect_cluster(
         );
         kept = Some(p.tokens);
     }
-    kept.unwrap()
+    kept.unwrap_or_else(|| (0..tok_count).collect())
 }
 
 /// Zero-reparse rendering using precomputed `StructSpan`s + `memchr` line extraction.
@@ -503,14 +503,14 @@ fn render_recommendation(
         out
     };
 
-    if line_roles.is_empty() {
+    let Some(&(max_line_u32, _)) = line_roles.last() else {
         return (Vec::new(), String::new());
-    }
+    };
 
     // Extract only the needed lines from `source` using `memchr`
     let source = index.sources.source(loc.file_id);
     let bytes = source.as_bytes();
-    let max_line = line_roles.last().unwrap().0 as usize;
+    let max_line = max_line_u32 as usize;
 
     let mut lines_out: Vec<RecommendedLine> = Vec::with_capacity(line_roles.len());
     let mut lr_idx = 0usize;

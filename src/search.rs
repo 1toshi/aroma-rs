@@ -428,10 +428,14 @@ pub(crate) fn rank_scored<'a>(
     sc.raw_cands.sort_unstable_by_key(|&(k, _)| k);
     sc.raw_cands
         .iter()
-        .map(|&(k, mid)| {
-            let loc = first_usable_location(index, lidx, mid as usize, origin, exclude)
-                .expect("candidate was already verified usable");
-            ScoredCandidate { mid, loc, score: !((k >> 32) as u32) }
+        .filter_map(|&(k, mid)| {
+            first_usable_location(index, lidx, mid as usize, origin, exclude).map(|loc| {
+                ScoredCandidate {
+                    mid,
+                    loc,
+                    score: !((k >> 32) as u32),
+                }
+            })
         })
         .collect()
 }
