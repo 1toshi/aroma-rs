@@ -317,3 +317,115 @@ fn test_custom_language_origin_exclude_and_query_helpers() {
     let wrong_lang = no_orig_q.with_language("unknown");
     assert!(search(&idx, &wrong_lang, &SearchOptions::default()).is_empty());
 }
+
+#[test]
+fn test_parallel_rayon_search_and_recommend_reentrancy() {
+    use rayon::prelude::*;
+
+    let files: Vec<SourceFile> = (0..12)
+        .map(|i| SourceFile {
+            path: format!("f_{i}.rs"),
+            source: format!(
+                r#"pub fn compute_batch_{i}(items: &[i32], factor: i32, limit: i32) -> i32 {{
+    let mut total = 0;
+    let mut valid = 0;
+    let mut bonus = 0;
+    for (idx, &val) in items.iter().enumerate() {{
+        let adjusted = val * factor + (idx as i32);
+        if adjusted > 0 && adjusted < limit {{
+            if adjusted % 2 == 0 {{
+                total += adjusted * 3 + 1;
+                valid += 1;
+            }} else {{
+                total += adjusted * 2 - 1;
+                bonus += adjusted / 4;
+            }}
+        }} else if adjusted == 0 {{
+            bonus += factor + 5;
+        }}
+    }}
+    let combined = total + bonus * 2;
+    record_metric_{i}(combined);
+    if valid > 0 {{
+        (combined / valid).clamp(-1000, 1000)
+    }} else {{
+        combined.max(0)
+    }}
+}}
+"#
+            ),
+        })
+        .collect();
+
+    let idx = build_index(
+        &files,
+        IndexOptions {
+            threads: Some(4),
+            ..Default::default()
+        },
+    );
+    let all_lines: Vec<u32> = (2..=26).collect();
+    let full_queries: Vec<_> = files
+        .iter()
+        .flat_map(|f| queries_from_lines(&idx, f, &all_lines))
+        .collect();
+    assert_eq!(full_queries.len(), 12);
+
+    let partial_queries: Vec<_> = files
+        .iter()
+        .flat_map(|f| queries_from_lines(&idx, f, &[2, 3, 4]))
+        .collect();
+    assert_eq!(partial_queries.len(), 12);
+
+    let search_opts = SearchOptions {
+        limit: 25,
+        min_similarity: 0.5,
+        ..Default::default()
+    };
+    let rec_opts = RecommendOptions::default();
+
+    let seq_search: Vec<_> = full_queries
+        .iter()
+        .map(|q| search(&idx, q, &search_opts))
+        .collect();
+    let seq_rec: Vec<_> = partial_queries
+        .iter()
+        .map(|q| recommend(&idx, q, &rec_opts))
+        .collect();
+    assert_eq!(seq_search[0].len(), 11);
+    assert!(!seq_rec[0].is_empty());
+
+    let par_search: Vec<_> = full_queries
+        .par_iter()
+        .map(|q| search(&idx, q, &search_opts))
+        .collect();
+    let par_rec: Vec<_> = partial_queries
+        .par_iter()
+        .map(|q| recommend(&idx, q, &rec_opts))
+        .collect();
+    assert_eq!(seq_search, par_search);
+    assert_eq!(seq_rec, par_rec);
+
+    // Same-thread re-entrant `search` invocation inside `exclude` must not panic on `RefCell`.
+    let reentrant = |m: &MethodRef| -> bool {
+        let nested = search(
+            &idx,
+            &full_queries[0],
+            &SearchOptions {
+                limit: 2,
+                ..Default::default()
+            },
+        );
+        !nested.is_empty() && m.path == "f_11.rs"
+    };
+    let filtered = search(
+        &idx,
+        &full_queries[1],
+        &SearchOptions {
+            exclude: Some(&reentrant),
+            ..Default::default()
+        },
+    );
+    assert!(!filtered.is_empty());
+    assert!(filtered.iter().all(|r| r.method.path != "f_11.rs"));
+}

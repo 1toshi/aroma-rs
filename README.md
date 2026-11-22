@@ -1,8 +1,8 @@
 # aroma-rs
 
-A high-performance Rust engine for **structural code search, clone detection, and code recommendation**, implementing **Aroma: Code Recommendation via Structural Code Search** (Luan et al., OOPSLA 2019).
+A high-performance Rust engine and CLI for **structural code search, clone detection, and code recommendation**, implementing **Aroma: Code Recommendation via Structural Code Search** (Luan et al., OOPSLA 2019).
 
-Originally built with full behavioral and numerical parity with [L9Labs/aroma-typescript](https://github.com/L9Labs/aroma-typescript) for Python and TypeScript/JavaScript (all 15 ported conformance tests pass, Recall@1 = `1.0` = `50/50`, identical indexing statistics and bit-exact work checksum `4173537680` across 100 queries on the 2,794-file evaluation corpus while running **10.1x–84.4x faster at indexing**, **21.4x–55.3x faster at search** with **58.7x** lower median latency at 15 threads, **164.9x–194.4x faster at recommendation** with **317.8x** lower median latency at 1 thread, and **2.1x–4.4x lower Peak RSS**), `aroma-rs` **extends beyond the original implementation with a built-in native Rust (`.rs`) front end** (`src/lang_rs.rs`).
+Originally built with full behavioral and numerical parity with [L9Labs/aroma-typescript](https://github.com/L9Labs/aroma-typescript) for Python and TypeScript/JavaScript (all 15 ported conformance tests pass, Recall@1 = `1.0` = `50/50`, identical indexing statistics and bit-exact work checksum `4173537680` across 100 queries on the 2,794-file evaluation corpus while running **10.1x–84.4x faster at indexing**, **21.4x–55.3x faster at search** with **58.7x** lower median latency at 15 threads, **164.9x–194.4x faster at recommendation** with **317.8x** lower median latency at 1 thread, and **2.1x–4.4x lower Peak RSS**), `aroma-rs` **extends beyond the original implementation with a built-in native Rust (`.rs`) front end** (`src/lang_rs.rs`) and a standalone agent-friendly CLI (`aroma`).
 
 ## Supported Languages
 
@@ -12,12 +12,74 @@ Originally built with full behavioral and numerical parity with [L9Labs/aroma-ty
 | **Python** | `"python"` | `.py` | Lezer LR/GLR runtime (`src/lang_py.rs`) | Full behavioral & numerical parity with `aroma-typescript` |
 | **TypeScript / JavaScript** | `"typescript"` | `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs` | Lezer LR/GLR runtime (`src/lang_ts.rs`) | Full behavioral & numerical parity with `aroma-typescript` |
 
+## Installation
+
+### CLI Binary
+
+```bash
+cargo install aroma-rs
+```
+
+For maximum single-host throughput:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo install aroma-rs
+```
+
+### Rust Library (`aroma`)
+
+To depend on the core structural indexing/search engine without pulling CLI serialization (`serde` / `serde_json`):
+
+```toml
+[dependencies]
+aroma-rs = { version = "0.1", default-features = false }
+```
+
+*(Note: the Cargo package name is `aroma-rs` and the library crate import is `aroma`.)*
+
+## CLI Usage
+
+### For AI Agents & Automation
+
+```bash
+# 1. One-call repository triage: corpus stats + top clone clusters + hotspot files + copy-paste follow-up commands
+aroma --robot-triage ./src
+
+# 2. Machine-readable capability contract (commands, flags, limits, exit codes)
+aroma capabilities --json
+
+# 3. Paste-ready agent handbook & JSON schemas
+aroma robot-docs guide
+aroma schema --command triage --json
+```
+
+### Interactive & Pipeline Commands
+
+```bash
+# Detect exact and near-duplicate functions across a codebase
+aroma clones ./src --lang rust --min-sim 0.80 --json
+
+# Search structurally by inline snippet, snippet file, or existing file line range
+aroma search ./src --snippet 'for &x in items { if x % 2 == 0 { sum += x; } }' --lang rust --json
+aroma search ./src --file src/lib.rs --lines 10-35 --json
+
+# Cluster matching implementations into idiomatic code recommendations
+aroma recommend ./src --file src/lib.rs --lines 10-35 --json
+
+# Run reproducible corpus manifest / query benchmark suite
+aroma bench --manifest /path/to/corpus_manifest.json --queries /path/to/queries.json --threads 15
+```
+
+- **Stdout vs. Stderr**: JSON commands (`--robot-triage`, `--json`, `bench`) write pure deterministic JSON strictly to `stdout`; alias notes, env warnings, and teaching errors go strictly to `stderr`.
+- **Exit codes**: `0` (`success`, including valid queries with 0 matches), `1` (`user-input-error`), `2` (`safety-block`, reserved), `3` (`tool-environment-error`).
+- **Environment variables**: `AROMA_ROBOT=1` (default to `--json`), `AROMA_THREADS=<N>`, `AROMA_NO_ENV_WARN=1`.
+
 ## Native Rust (`.rs`) Front End
 
 - **Item extraction & qualified names**: Indexes free functions, inherent `impl` methods (`Type::method`), trait `impl` methods (`<Type as Trait>::method`), default trait methods (`Trait::method`), `mod`-qualified items (`mod::item`), and nested `fn`s, while skipping bodyless trait/`extern` declarations.
 - **Scope-aware alpha-renaming & usage features**: Pass-1 local binder (`NameSet`) collects parameters, `let`, `for`, `if let`, `while let`, `match` arm, and closure bindings so local variables normalize to `#VAR`, `self` receivers match structurally, non-local paths/types/globals remain concrete `NAME` tokens, and receiver/method calls emit `#.#` usage (`U`) features.
 - **Syntax coverage & error recovery**: Handles nested block comments, lifetime vs. character-literal disambiguation, raw (`r#"..."#`) / byte / raw-byte / C-string literals, raw identifiers (`r#ident`), turbofish, macros, `async`/`unsafe`/`const`/`extern` items, and partial or malformed snippets (`query_from_snippet` / `queries_from_lines`) without panicking.
-- **No extra dependencies**: Compiles with the existing minimal dependency set in `Cargo.toml`.
+- **No extra dependencies**: Compiles with the core dependency set without tree-sitter or C build steps.
 
 ## Architecture
 
@@ -26,25 +88,7 @@ Originally built with full behavioral and numerical parity with [L9Labs/aroma-ty
 - **Indexing & storage (`src/index.rs`)**: Wait-free LPT chunk parsing -> 32-shard `ShardedFeatureTable` (bits `32..37` shard index preserving full SwissTable H2 entropy) -> parallel `MaybeUninit` feature remap -> parallel bucketed `(count << 24) | local_mid` inverted index -> single contiguous `SourceStore` blob. Single-threaded mode (`--threads 1`) skips all Rayon pools and intermediate chunk staging.
 - **Phases I & II search (`src/search.rs`, `src/prune.rs`)**: Branchless 4x-unrolled Phase I scatter computing overlap and capped Phase II score bounds in one pass; `canonical_file_id` L1 origin filtering; `select_nth_unstable` top-k extraction; 4 KB L1 Bloom filter + direct `qidx[fid]` lookup; Algorithm 1 `prune` with zero-greedy & `max_gain == 1` fast paths, signature-equivalence-class greedy (`SIG_THRESHOLD = 512`) with inline 64-bit tags, `[u64; 8]` 512-line stack bitset line extraction, and reusable `kept_buf` scratch.
 - **Clustering & recommendations (`src/recommend.rs`)**: Lazy on-demand candidate feature multisets backed by `SearchScratch` flat pools, `u128` popcount `jaccard` deduplication, precomputed `StructSpan` structure lines, and a 512-byte stack `LineRole` map.
-
-## Build, Test & Benchmark
-
-Requires Rust 2024 toolchain (`rustc 1.100.0` used during verification).
-
-```bash
-# Run all 27 conformance, Rust front-end, and stress/overflow/determinism tests
-cargo test --release --offline
-
-# Run clippy
-cargo clippy --offline --lib --bin aroma -- -D warnings
-cargo clippy --offline --test extra --test rust_frontend -- -D warnings
-
-# Run CLI benchmark against a JSON corpus manifest and query suite
-cargo run --release --offline -- bench \
-  --manifest /path/to/corpus_manifest.json \
-  --queries /path/to/queries.json \
-  --threads 15
-```
+- **Agent-ergonomic CLI (`src/cli/`, `src/main.rs`)**: Pure-core argument parser + intent inference separated from thin filesystem walking and command execution (`triage`, `clones`, `search`, `recommend`, `capabilities`, `robot-docs`, `schema`, `bench`), gated behind the `cli` feature.
 
 ## Library Usage
 
@@ -82,9 +126,30 @@ let recs = recommend(&index, &query, &RecommendOptions::default());
 let line_queries = queries_from_lines(&index, &files[0], &[1]);
 ```
 
+## Build, Test & Benchmark
+
+Requires Rust 2024 toolchain (`rust-version = "1.88"`).
+
+```bash
+# Run full test suite + doc tests (with and without CLI feature)
+cargo nextest run --release --offline --no-fail-fast
+cargo test --release --doc --offline
+cargo test --no-default-features --lib --doc --offline
+
+# Run clippy across all targets and feature combinations
+cargo clippy --offline --lib --bin aroma --test extra --test rust_frontend --test cli -- -D warnings
+cargo clippy --offline --no-default-features --lib -- -D warnings
+
+# Run native-tuned benchmark
+RUSTFLAGS="-C target-cpu=native" cargo run --release -- bench \
+  --manifest /path/to/corpus_manifest.json \
+  --queries /path/to/queries.json \
+  --threads 15
+```
+
 ## Verified Benchmarks
 
-Measured on Apple M5 Pro (15 cores, 24 GB RAM), `-C target-cpu=native`, macOS system allocator, `panic = "abort"`, using alternating execution order (`compare_bench.py`) against upstream `L9Labs/aroma-typescript` under Bun v1.4.4.
+Measured on Apple M5 Pro (15 cores, 24 GB RAM), `RUSTFLAGS="-C target-cpu=native"`, macOS system allocator, `panic = "abort"`, using alternating execution order (`compare_bench.py`) against upstream `L9Labs/aroma-typescript` under Bun v1.4.4.
 
 ### Python + TypeScript/JavaScript vs. `aroma-typescript`
 

@@ -87,9 +87,21 @@ pub(crate) struct SearchScratch {
 }
 
 thread_local! {
-    pub(crate) static TL_SEARCH: RefCell<SearchScratch> = RefCell::new(SearchScratch::default());
+    static TL_SEARCH: RefCell<SearchScratch> = RefCell::new(SearchScratch::default());
     static TL_PAR_PRUNE: RefCell<(PruneScratch, Vec<usize>)> =
         RefCell::new((PruneScratch::default(), Vec::new()));
+}
+
+/// Grants re-entrancy-safe mutable access to a thread-local `SearchScratch`,
+/// falling back to a fresh scratch buffer if called re-entrantly on the same thread.
+pub(crate) fn with_search_scratch<R>(f: impl FnOnce(&mut SearchScratch) -> R) -> R {
+    TL_SEARCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut guard) => f(&mut guard),
+        Err(_) => {
+            let mut local = SearchScratch::default();
+            f(&mut local)
+        }
+    })
 }
 
 #[inline]
@@ -496,9 +508,7 @@ pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) ->
     };
     let qsize = query.size as f64;
 
-    TL_SEARCH.with(|cell| {
-        let mut sc = cell.borrow_mut();
-        let sc = &mut *sc;
+    with_search_scratch(|sc| {
         let scored = rank_scored(
             index,
             lidx,
@@ -533,7 +543,8 @@ pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) ->
         let qmap = &sc.fast_qmap;
         let ptarget = &sc.prune_target;
 
-        let results = if let Some(pool) = index.pool.as_ref()
+        let results = if rayon::current_thread_index().is_none()
+            && let Some(pool) = index.pool.as_ref()
             && survivors.len() >= 4
             && total_toks >= PAR_PRUNE_TOK_THRESHOLD
         {
@@ -663,7 +674,8 @@ pub(crate) fn rank_for_recommend<'a>(
     let qmap = &sc.fast_qmap;
     let ptarget = &sc.prune_target;
 
-    let out = if let Some(pool) = index.pool.as_ref()
+    let out = if rayon::current_thread_index().is_none()
+        && let Some(pool) = index.pool.as_ref()
         && survivors.len() >= 16
         && total_toks >= PAR_PRUNE_REC_TOK_THRESHOLD
     {

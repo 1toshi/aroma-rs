@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 
 use crate::index::{AromaIndex, LanguageIndex, MethodLocation, Query};
 use crate::prune::prune_fast;
-use crate::search::{rank_for_recommend, SearchScratch, DEFAULT_SEARCH_LIMIT, TL_SEARCH};
+use crate::search::{rank_for_recommend, with_search_scratch, SearchScratch, DEFAULT_SEARCH_LIMIT};
 use crate::text::{drop_chars, js_indent, js_trim, js_trim_end};
 use crate::MethodRef;
 
@@ -580,9 +580,7 @@ pub fn recommend(
     };
     let qsize = query.size as f64;
 
-    TL_SEARCH.with(|cell| {
-        let mut sc = cell.borrow_mut();
-        let sc = &mut *sc;
+    with_search_scratch(|sc| {
         let candidates = rank_for_recommend(
             index,
             lidx,

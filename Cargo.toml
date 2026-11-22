@@ -1,9 +1,16 @@
 [package]
-name = "aroma"
+name = "aroma-rs"
 version = "0.1.0"
 edition = "2024"
-description = "Aroma: fast structural code search, clone detection, and recommendation engine for Python, TypeScript/JavaScript, and Rust"
+rust-version = "1.88"
+description = "Fast structural code search, clone detection, and recommendation engine for Rust, Python, and TypeScript/JavaScript"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/moorbrook/aroma-rs"
+documentation = "https://docs.rs/aroma-rs"
+keywords = ["code-search", "clone-detection", "ast", "aroma", "static-analysis"]
+categories = ["development-tools", "command-line-utilities", "text-processing"]
+exclude = [".cargo/**", ".local/**", "ARENA_SYNTHESIS.md", "agent_ergonomics_audit/**", "rust-toolchain.toml"]
 
 [lib]
 name = "aroma"
@@ -12,15 +19,20 @@ path = "src/lib.rs"
 [[bin]]
 name = "aroma"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
-hashbrown = "=0.15.5"
-memchr = "=2.7.6"
-rayon = "=1.11.0"
-rustc-hash = "=2.1.1"
-serde = { version = "=1.0.228", features = ["derive"] }
-serde_json = "=1.0.149"
-xxhash-rust = { version = "=0.8.18", features = ["xxh3"] }
+hashbrown = "0.15.5"
+memchr = "2.7.6"
+rayon = "1.11.0"
+rustc-hash = "2.1.1"
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+serde = { version = "1.0.228", features = ["derive"], optional = true }
+serde_json = { version = "1.0.149", optional = true }
 
 [profile.release]
 opt-level = 3

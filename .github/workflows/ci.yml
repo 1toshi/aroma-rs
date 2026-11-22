@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Test, Clippy & Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Test (default features, release)
+        run: cargo test --release --locked
+      - name: Test library without CLI features
+        run: cargo test --no-default-features --lib --doc --locked
+      - name: Clippy (default features)
+        run: cargo clippy --lib --bin aroma --test extra --test rust_frontend --test cli --locked -- -D warnings
+      - name: Clippy (library only, no default features)
+        run: cargo clippy --no-default-features --lib --locked -- -D warnings
+      - name: Verify crate packaging
+        run: cargo package --locked --no-verify && cargo package --list --locked

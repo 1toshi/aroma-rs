@@ -2426,18 +2426,21 @@ impl<'a> RsParser<'a> {
                 {
                     let mark = self.body.mark();
                     self.push_tok(KW, false); // `async`
-                    let pipe_k = self.peek_kind(1).unwrap();
-                    let cl = self.parse_closure(pipe_k, true, allow_struct, depth + 1);
-                    self.push_opt(cl);
+                    if let Some(pipe_k) = self.peek_kind(1) {
+                        let cl = self.parse_closure(pipe_k, true, allow_struct, depth + 1);
+                        self.push_opt(cl);
+                    }
                     self.body.close_node(mark).map(|n| (n, false))
                 } else {
                     Some((self.emit_tok(KW, false), false))
                 }
             }
-            TK::KwMove if matches!(self.peek_kind(1), Some(TK::Pipe | TK::OrOr)) => {
-                let pipe_k = self.peek_kind(1).unwrap();
-                self.parse_closure(pipe_k, true, allow_struct, depth + 1).map(|n| (n, false))
-            }
+            TK::KwMove => match self.peek_kind(1) {
+                Some(pipe_k @ (TK::Pipe | TK::OrOr)) => {
+                    self.parse_closure(pipe_k, true, allow_struct, depth + 1).map(|n| (n, false))
+                }
+                _ => Some((self.emit_tok(KW, false), false)),
+            },
             TK::Pipe | TK::OrOr => {
                 self.parse_closure(t.kind, false, allow_struct, depth + 1).map(|n| (n, false))
             }
