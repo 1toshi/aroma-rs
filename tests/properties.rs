@@ -167,13 +167,14 @@ fn prop_alpha_renaming_invariance_across_languages() {
             ("typescript", "a.ts", gen_ts_pair(&mut rng, seed)),
         ];
         for (lang, path, (src_a, src_b)) in cases {
-            let file_a = SourceFile { path: path.into(), source: src_a };
-            let file_b = SourceFile { path: format!("ren_{path}"), source: src_b };
-            let idx_a = build_index(std::slice::from_ref(&file_a), IndexOptions { threads: Some(1), ..Default::default() });
-            let idx_b = build_index(std::slice::from_ref(&file_b), IndexOptions { threads: Some(1), ..Default::default() });
+            let files = [
+                SourceFile { path: path.into(), source: src_a },
+                SourceFile { path: format!("ren_{path}"), source: src_b },
+            ];
+            let idx = build_index(&files, IndexOptions { threads: Some(1), ..Default::default() });
 
-            let qa = queries_from_lines(&idx_a, &file_a, &[1, 2, 3, 4, 5, 6, 7, 8]);
-            let qb = queries_from_lines(&idx_b, &file_b, &[1, 2, 3, 4, 5, 6, 7, 8]);
+            let qa = queries_from_lines(&idx, &files[0], &[1, 2, 3, 4, 5, 6, 7, 8]);
+            let qb = queries_from_lines(&idx, &files[1], &[1, 2, 3, 4, 5, 6, 7, 8]);
             assert_eq!(qa.len(), 1, "{lang} seed {seed} orig query missing");
             assert_eq!(qb.len(), 1, "{lang} seed {seed} renamed query missing");
             assert_eq!(
@@ -182,16 +183,32 @@ fn prop_alpha_renaming_invariance_across_languages() {
                 "{lang} seed {seed} feature count drifted across alpha-renaming"
             );
 
-            let q_for_a = qb[0].with_language(lang).without_origin();
-            let hits = search(&idx_a, &q_for_a, &SearchOptions::default());
-            assert!(
-                !hits.is_empty(),
-                "{lang} seed {seed} alpha-renamed query missed indexed method"
+            let hits = search(&idx, &qb[0], &SearchOptions::default());
+            assert_eq!(
+                hits.len(),
+                1,
+                "{lang} seed {seed} expected 1 alpha-renamed hit (orig file), got {}",
+                hits.len()
             );
+            assert_eq!(hits[0].method.path, files[0].path);
             assert!(
                 (hits[0].similarity - 1.0).abs() < 1e-12,
                 "{lang} seed {seed} similarity={} != 1.0",
                 hits[0].similarity
+            );
+
+            let rev_hits = search(&idx, &qa[0], &SearchOptions::default());
+            assert_eq!(
+                rev_hits.len(),
+                1,
+                "{lang} seed {seed} expected 1 reverse hit (renamed file), got {}",
+                rev_hits.len()
+            );
+            assert_eq!(rev_hits[0].method.path, files[1].path);
+            assert!(
+                (rev_hits[0].similarity - 1.0).abs() < 1e-12,
+                "{lang} seed {seed} reverse similarity={} != 1.0",
+                rev_hits[0].similarity
             );
         }
     }
