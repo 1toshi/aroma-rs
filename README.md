@@ -1,8 +1,23 @@
 # aroma-rs
 
-A high-performance Rust port of [L9Labs/aroma-typescript](https://github.com/L9Labs/aroma-typescript), implementing **Aroma: Code Recommendation via Structural Code Search** (Luan et al., OOPSLA 2019).
+A high-performance Rust engine for **structural code search, clone detection, and code recommendation**, implementing **Aroma: Code Recommendation via Structural Code Search** (Luan et al., OOPSLA 2019).
 
-`aroma-rs` preserves full behavioral and numerical parity with the TypeScript/Lezer reference implementation for Python and TypeScript/JavaScript (all 15 ported conformance tests pass, Recall@1 = `1.0` = `50/50`, identical indexing statistics and bit-exact work checksum `4173537680` across 100 queries on the 2,794-file evaluation corpus) while running **10.1x–84.4x faster at indexing**, **21.4x–55.3x faster at search** (**58.7x** lower median latency at 15 threads), and **164.9x–194.4x faster at recommendation** (**317.8x** lower median latency at 1 thread) with **2.1x–4.4x lower Peak RSS**. In addition to Python and TypeScript/JavaScript, `aroma-rs` includes a built-in native Rust (`.rs`) front end.
+Originally built with full behavioral and numerical parity with [L9Labs/aroma-typescript](https://github.com/L9Labs/aroma-typescript) for Python and TypeScript/JavaScript (all 15 ported conformance tests pass, Recall@1 = `1.0` = `50/50`, identical indexing statistics and bit-exact work checksum `4173537680` across 100 queries on the 2,794-file evaluation corpus while running **10.1x–84.4x faster at indexing**, **21.4x–55.3x faster at search** with **58.7x** lower median latency at 15 threads, **164.9x–194.4x faster at recommendation** with **317.8x** lower median latency at 1 thread, and **2.1x–4.4x lower Peak RSS**), `aroma-rs` **extends beyond the original implementation with a built-in native Rust (`.rs`) front end** (`src/lang_rs.rs`).
+
+## Supported Languages
+
+| Language | ID | Extensions | Front End | Parity / Status |
+| --- | --- | --- | --- | --- |
+| **Rust** | `"rust"` | `.rs` | Native zero-dependency byte-slice lexer + Pass-1 local binder + error-recovering recursive-descent/Pratt parser (`src/lang_rs.rs`) | **New in `aroma-rs`** (not in `aroma-typescript`) |
+| **Python** | `"python"` | `.py` | Lezer LR/GLR runtime (`src/lang_py.rs`) | Full behavioral & numerical parity with `aroma-typescript` |
+| **TypeScript / JavaScript** | `"typescript"` | `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs` | Lezer LR/GLR runtime (`src/lang_ts.rs`) | Full behavioral & numerical parity with `aroma-typescript` |
+
+## Native Rust (`.rs`) Front End
+
+- **Item extraction & qualified names**: Indexes free functions, inherent `impl` methods (`Type::method`), trait `impl` methods (`<Type as Trait>::method`), default trait methods (`Trait::method`), `mod`-qualified items (`mod::item`), and nested `fn`s, while skipping bodyless trait/`extern` declarations.
+- **Scope-aware alpha-renaming & usage features**: Pass-1 local binder (`NameSet`) collects parameters, `let`, `for`, `if let`, `while let`, `match` arm, and closure bindings so local variables normalize to `#VAR`, `self` receivers match structurally, non-local paths/types/globals remain concrete `NAME` tokens, and receiver/method calls emit `#.#` usage (`U`) features.
+- **Syntax coverage & error recovery**: Handles nested block comments, lifetime vs. character-literal disambiguation, raw (`r#"..."#`) / byte / raw-byte / C-string literals, raw identifiers (`r#ident`), turbofish, macros, `async`/`unsafe`/`const`/`extern` items, and partial or malformed snippets (`query_from_snippet` / `queries_from_lines`) without panicking.
+- **No extra dependencies**: Compiles with the existing minimal dependency set in `Cargo.toml`.
 
 ## Architecture
 
@@ -33,33 +48,47 @@ cargo run --release --offline -- bench \
 
 ## Library Usage
 
+`build_index` automatically dispatches `.rs`, `.py`, and `.ts`/`.tsx`/`.mts`/`.cts`/`.js`/`.jsx`/`.mjs`/`.cjs` files through `builtin_languages()`:
+
 ```rust
 use aroma::{
     build_index, queries_from_lines, query_from_snippet, recommend, search,
     IndexOptions, RecommendOptions, SearchOptions, SnippetOptions, SourceFile,
 };
 
-let files = vec![SourceFile {
-    path: "example.py".into(),
-    source: "def add(x, y):\n    return x + y\n".into(),
-}];
+let files = vec![
+    SourceFile {
+        path: "src/lib.rs".into(),
+        source: "pub fn sum_even(xs: &[i32]) -> i32 { xs.iter().filter(|x| *x % 2 == 0).sum() }\n".into(),
+    },
+    SourceFile {
+        path: "example.py".into(),
+        source: "def add(x, y):\n    return x + y\n".into(),
+    },
+];
 
 let index = build_index(&files, IndexOptions::default());
+
+// Search & recommend by Rust snippet (or pass lines to `queries_from_lines` for clone lookup)
 let query = query_from_snippet(
     &index,
-    "return a + b",
-    &SnippetOptions { language: Some("python".into()), ..Default::default() },
-).unwrap();
+    "values.iter().filter(|v| *v % 2 == 0).sum()",
+    &SnippetOptions { language: Some("rust".into()), ..Default::default() },
+)
+.unwrap();
 
 let hits = search(&index, &query, &SearchOptions::default());
 let recs = recommend(&index, &query, &RecommendOptions::default());
+let line_queries = queries_from_lines(&index, &files[0], &[1]);
 ```
 
 ## Verified Benchmarks
 
 Measured on Apple M5 Pro (15 cores, 24 GB RAM), `-C target-cpu=native`, macOS system allocator, `panic = "abort"`, using alternating execution order (`compare_bench.py`) against upstream `L9Labs/aroma-typescript` under Bun v1.4.4.
 
-### Full Corpus (2,794 files: 1,447 Python + 1,347 TS/TSX/JS/JSX, 29.14 MB source, 100 queries — 7 alternating rounds)
+### Python + TypeScript/JavaScript vs. `aroma-typescript`
+
+#### Full Corpus (2,794 files: 1,447 Python + 1,347 TS/TSX/JS/JSX, 29.14 MB source, 100 queries — 7 alternating rounds)
 
 All 3 targets produced identical outputs: `methods = 21,866`, `duplicate_methods = 7,112`, `features = 756,440`, `Recall@1 = 1.00 (50/50)`, `total_search_hits = 10,000`, `total_recommendations = 40`, `work_checksum = 4173537680`, `errors = 0`.
 
@@ -76,7 +105,7 @@ All 3 targets produced identical outputs: `methods = 21,866`, `duplicate_methods
 | `wall_ms` | 8934.40 ms [8864.0..9029.8] | **649.80 ms** [647.4..657.4] | **13.7x** | **149.50 ms** [148.1..151.0] | **59.8x** |
 | Peak RSS | 699.97 MB [682.3..725.8] | **158.94 MB** [158.9..159.0] | **4.40x smaller** | **332.58 MB** [328.5..335.4] | **2.10x smaller** |
 
-### Small-Corpus Sensitivity Check (300 files, 2.92 MB, 40 queries — 3 alternating rounds)
+#### Small-Corpus Sensitivity Check (300 files, 2.92 MB, 40 queries — 3 alternating rounds)
 
 `methods = 2,692`, `duplicate_methods = 687`, `features = 109,103`, `Recall@1 = 1.00 (20/20)`, `work_checksum = 1152710901`, `errors = 0`.
 
@@ -88,9 +117,13 @@ All 3 targets produced identical outputs: `methods = 21,866`, `duplicate_methods
 | `wall_ms` | 1006.60 ms | **79.71 ms** (12.6x) | **30.29 ms** (33.2x) |
 | Peak RSS | 178.27 MB | **24.67 MB** (7.23x smaller) | **65.42 MB** (2.72x smaller) |
 
+### Native Rust Front-End Throughput (Real-World Multi-Repo Stress Test)
+
+Across a 72-repository multi-language stress corpus (`6,193` total files: `3,588` Python/TS/JS + `2,605` Rust), adding the native Rust front end indexed **`2,605` `.rs` files** (`36,149` canonical methods, `1,393` exact duplicate methods, `1,342,125` structural features) in **`606.7 ms` single-threaded** (`831.6 ms -> 1,438.3 ms` total 1T index build; **`~4,300` `.rs` files/s** and **`~59,600` canonical Rust methods/s** on 1 thread) with zero panics.
+
 ## Remaining Limiters ("Why Not Double?")
 
-1. **Indexing (`525.7 ms` 1T / `63.0 ms` 15T)**: Exact Lezer LR/GLR parsing + AST simplification accounts for ~69% of single-thread indexing time to maintain 100% AST and malformed-syntax parity with `aroma-typescript`. At 15 threads (`8.34x` scaling over 1T on a heterogeneous 5 P-core + 10 E-core CPU), deterministic Stage 2 dedup/CSR merge + Stage 3 interning/inverted-index assembly (~15 ms post-parse) plus memory bandwidth form the remaining Amdahl floor.
+1. **Indexing (`525.7 ms` 1T / `63.0 ms` 15T on the Python+TS corpus)**: Exact Lezer LR/GLR parsing + AST simplification accounts for ~69% of single-thread indexing time to maintain 100% AST and malformed-syntax parity with `aroma-typescript`. At 15 threads (`8.34x` scaling over 1T on a heterogeneous 5 P-core + 10 E-core CPU), deterministic Stage 2 dedup/CSR merge + Stage 3 interning/inverted-index assembly (~15 ms post-parse) plus memory bandwidth form the remaining Amdahl floor.
 2. **Search (`68.8 ms` 1T / `26.7 ms` 15T over 100 queries)**: Algorithm 1 exact greedy `prune` consumes ~90% of `1T` search time (`~81%` on `15T`). Queries with fewer than 768 candidate tokens stay single-threaded because Rayon synchronization exceeds the microsecond-scale compute.
 3. **Recommend (`9.57 ms` 1T / `11.28 ms` 15T)**: Per-query clustering runs in ~46 us median (`1T`), below profitable Rayon fan-out granularity (`15T` pays minor L2/NUMA cache-coherency overhead from the index built across worker cores).
 

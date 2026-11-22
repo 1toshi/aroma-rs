@@ -2,7 +2,7 @@
 name = "aroma"
 version = "0.1.0"
 edition = "2024"
-description = "Aroma: code recommendation via structural code search (Rust port of aroma-typescript)"
+description = "Aroma: fast structural code search, clone detection, and recommendation engine for Python, TypeScript/JavaScript, and Rust"
 license = "MIT"
 
 [lib]
