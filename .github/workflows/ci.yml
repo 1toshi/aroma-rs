@@ -23,13 +23,13 @@ jobs:
         run: |
           cargo test --no-default-features --lib --locked
           cargo test --no-default-features --doc --locked
-          cargo test --no-default-features --test extra --locked
+          cargo test --no-default-features --test extra --test properties --locked
       - name: Doc build (no warnings)
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --no-deps --all-features --locked
       - name: Clippy (default features)
-        run: cargo clippy --lib --bin aroma --test extra --test rust_frontend --test cli --locked -- -D warnings
+        run: cargo clippy --lib --bin aroma --test extra --test rust_frontend --test cli --test properties --locked -- -D warnings
       - name: Clippy (library only, no default features)
         run: cargo clippy --no-default-features --lib --locked -- -D warnings
       - name: Verify crate packaging
