@@ -11,6 +11,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::features::{extract_location_and_spans, featurize_body_hashed, FeatScratch, StructSpan};
 use crate::lang_py::{self, FastMethod};
+use crate::lang_rs;
 use crate::lang_ts;
 use crate::lezer;
 use crate::simple::Body;
@@ -510,6 +511,7 @@ fn parse_file_into_body(
     match lang.builtin_kind() {
         1 => lang_py::parse_methods_into(&file.source, line_range, body, out),
         2 => lang_ts::parse_methods_into(&file.source, &file.path, line_range, body, out),
+        3 => lang_rs::parse_methods_into(&file.source, line_range, body, out),
         _ => {
             for m in lang.parse_methods(&file.source, &file.path) {
                 if let Some((min_ln, max_ln)) = line_range
@@ -869,6 +871,7 @@ fn build_index_single(
     drop(seen);
     lezer::shrink_tl_workspace();
     lang_py::shrink_tl_tree();
+    lang_rs::shrink_tl_scratch();
     lang_ts::shrink_tl_tree();
 
     let feature_count = next_fid as usize;
@@ -1882,6 +1885,7 @@ fn build_index_parallel(
         pool.broadcast(|_| {
             lezer::shrink_tl_workspace();
             lang_py::shrink_tl_tree();
+            lang_rs::shrink_tl_scratch();
             TL_SCRATCH.with(|cell| *cell.borrow_mut() = ParseScratch::default());
         });
 
@@ -2011,6 +2015,10 @@ pub fn query_from_snippet(
             }
             2 => {
                 let r = lang_ts::parse_snippet_into(source, options, &mut sc.body)?;
+                (r, source.as_bytes())
+            }
+            3 => {
+                let r = lang_rs::parse_snippet_into(source, options, &mut sc.body)?;
                 (r, source.as_bytes())
             }
             _ => {

@@ -2,11 +2,11 @@
 
 A high-performance Rust port of [L9Labs/aroma-typescript](https://github.com/L9Labs/aroma-typescript), implementing **Aroma: Code Recommendation via Structural Code Search** (Luan et al., OOPSLA 2019).
 
-`aroma-rs` preserves full behavioral and numerical parity with the TypeScript/Lezer reference implementation (all 15 ported conformance tests pass, Recall@1 = `1.0` = `50/50`, identical indexing statistics and bit-exact work checksum `4173537680` across 100 queries on the 2,794-file evaluation corpus) while running **10.1x–84.4x faster at indexing**, **21.4x–55.3x faster at search** (**58.7x** lower median latency at 15 threads), and **164.9x–194.4x faster at recommendation** (**317.8x** lower median latency at 1 thread) with **2.1x–4.4x lower Peak RSS**.
+`aroma-rs` preserves full behavioral and numerical parity with the TypeScript/Lezer reference implementation for Python and TypeScript/JavaScript (all 15 ported conformance tests pass, Recall@1 = `1.0` = `50/50`, identical indexing statistics and bit-exact work checksum `4173537680` across 100 queries on the 2,794-file evaluation corpus) while running **10.1x–84.4x faster at indexing**, **21.4x–55.3x faster at search** (**58.7x** lower median latency at 15 threads), and **164.9x–194.4x faster at recommendation** (**317.8x** lower median latency at 1 thread) with **2.1x–4.4x lower Peak RSS**. In addition to Python and TypeScript/JavaScript, `aroma-rs` includes a built-in native Rust (`.rs`) front end.
 
 ## Architecture
 
-- **Lezer runtime & front ends (`src/lezer/`, `src/lang_py.rs`, `src/lang_ts.rs`, `src/simple.rs`, `src/text.rs`)**: Row-deduplicated LR action tables with 16-byte aligned `FastState` descriptors, `SINK_BIT` DFA early exit, inline `Stack.buffer` + `StackArena::collapse_to_root` GLR pruning, SIMD `memchr` literal/comment scanners, zero-copy ASCII `Src` wrapper, unified `FrontScratch` + zero-alloc `NameSet`, and AST simplification into a flat `Body` arena with a 128-bit algebraic dedup digest.
+- **Lezer runtime & front ends (`src/lezer/`, `src/lang_py.rs`, `src/lang_ts.rs`, `src/lang_rs.rs`, `src/simple.rs`, `src/text.rs`)**: Row-deduplicated LR action tables with 16-byte aligned `FastState` descriptors, `SINK_BIT` DFA early exit, inline `Stack.buffer` + `StackArena::collapse_to_root` GLR pruning, SIMD `memchr` literal/comment scanners, zero-copy ASCII `Src` wrapper, unified `FrontScratch` + zero-alloc `NameSet`, a zero-dependency byte-slice Rust lexer + recursive-descent/Pratt parser with local scope binding and `#.#` method-call extraction, and AST simplification into a flat `Body` arena with a 128-bit algebraic dedup digest.
 - **Structural featurization (`src/features.rs`)**: Single-pass CSR emission of `T`, up-to-3 `P`, `S`, and consecutive-local `U` features using zero-`String` 64-bit algebraic `mix` hashes and 1-byte `token_end_delta` spans (`255` overflow map).
 - **Indexing & storage (`src/index.rs`)**: Wait-free LPT chunk parsing -> 32-shard `ShardedFeatureTable` (bits `32..37` shard index preserving full SwissTable H2 entropy) -> parallel `MaybeUninit` feature remap -> parallel bucketed `(count << 24) | local_mid` inverted index -> single contiguous `SourceStore` blob. Single-threaded mode (`--threads 1`) skips all Rayon pools and intermediate chunk staging.
 - **Phases I & II search (`src/search.rs`, `src/prune.rs`)**: Branchless 4x-unrolled Phase I scatter computing overlap and capped Phase II score bounds in one pass; `canonical_file_id` L1 origin filtering; `select_nth_unstable` top-k extraction; 4 KB L1 Bloom filter + direct `qidx[fid]` lookup; Algorithm 1 `prune` with zero-greedy & `max_gain == 1` fast paths, signature-equivalence-class greedy (`SIG_THRESHOLD = 512`) with inline 64-bit tags, `[u64; 8]` 512-line stack bitset line extraction, and reusable `kept_buf` scratch.
@@ -17,11 +17,12 @@ A high-performance Rust port of [L9Labs/aroma-typescript](https://github.com/L9L
 Requires Rust 2024 toolchain (`rustc 1.100.0` used during verification).
 
 ```bash
-# Run all 21 conformance + stress/overflow/determinism tests
+# Run all 27 conformance, Rust front-end, and stress/overflow/determinism tests
 cargo test --release --offline
 
 # Run clippy
 cargo clippy --offline --lib --bin aroma -- -D warnings
+cargo clippy --offline --test extra --test rust_frontend -- -D warnings
 
 # Run CLI benchmark against a JSON corpus manifest and query suite
 cargo run --release --offline -- bench \

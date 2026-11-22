@@ -93,6 +93,34 @@ impl Body {
     }
 
     #[inline(always)]
+    pub(crate) fn mark(&self) -> usize {
+        self.scratch.len()
+    }
+
+    #[inline(always)]
+    pub(crate) fn push_child(&mut self, id: u32) {
+        self.scratch.push(id);
+    }
+
+    #[inline(always)]
+    pub(crate) fn push_tok(
+        &mut self,
+        kind: u8,
+        local: bool,
+        line: u32,
+        end_line: u32,
+        a: u32,
+        b: u32,
+    ) -> u32 {
+        self.push(Item { kind, local, line, end_line, a, b })
+    }
+
+    #[inline]
+    pub(crate) fn close_node(&mut self, mark: usize) -> Option<u32> {
+        self.close(mark)
+    }
+
+    #[inline(always)]
     fn push(&mut self, it: Item) -> u32 {
         let id = self.items.len() as u32;
         self.items.push(it);

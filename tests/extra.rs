@@ -10,7 +10,7 @@ use aroma::{
 fn test_empty_unsupported_and_oversized_corpus() {
     let files = vec![
         SourceFile { path: "notes.md".into(), source: "# hello".into() },
-        SourceFile { path: "lib.rs".into(), source: "fn main() {}".into() },
+        SourceFile { path: "main.go".into(), source: "package main\nfunc main() {}\n".into() },
         SourceFile {
             path: "big.py".into(),
             source: format!("def f(x):\n    return {}\n", "x + ".repeat(200)),

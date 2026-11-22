@@ -6,6 +6,7 @@ use std::collections::HashSet;
 pub(crate) mod features;
 pub(crate) mod index;
 pub(crate) mod lang_py;
+pub(crate) mod lang_rs;
 pub(crate) mod lang_ts;
 pub(crate) mod lezer;
 pub(crate) mod prune;
@@ -81,8 +82,12 @@ pub fn typescript_language() -> Box<dyn Language> {
     Box::new(lang_ts::TypeScriptLanguage)
 }
 
+pub fn rust_language() -> Box<dyn Language> {
+    Box::new(lang_rs::RustLanguage)
+}
+
 pub fn builtin_languages() -> Vec<Box<dyn Language>> {
-    vec![python_language(), typescript_language()]
+    vec![python_language(), typescript_language(), rust_language()]
 }
 
 pub use features::{

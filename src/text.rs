@@ -382,29 +382,65 @@ impl NameSet {
     }
 
     #[inline(always)]
+    pub fn contains_bytes(&self, bytes: &[u8], from: u32, to: u32) -> bool {
+        if self.used.is_empty() {
+            return false;
+        }
+        let len = to - from;
+        let key = unsafe { bytes.get_unchecked(from as usize..to as usize) };
+        let h32 = hash_name_u8(key);
+        let mut i = probe_start(h32, self.mask);
+        loop {
+            let s = unsafe { *self.slots.get_unchecked(i) };
+            if s.start == EMPTY_SLOT {
+                return false;
+            }
+            if s.hash == h32
+                && s.len == len
+                && unsafe { bytes.get_unchecked(s.start as usize..(s.start + s.len) as usize) } == key
+            {
+                return true;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
+    pub fn insert_bytes(&mut self, bytes: &[u8], from: u32, to: u32) {
+        let len = to - from;
+        let key = unsafe { bytes.get_unchecked(from as usize..to as usize) };
+        let h32 = hash_name_u8(key);
+        let mut i = probe_start(h32, self.mask);
+        loop {
+            let s = unsafe { *self.slots.get_unchecked(i) };
+            if s.start == EMPTY_SLOT {
+                unsafe {
+                    *self.slots.get_unchecked_mut(i) = NameSlot { hash: h32, start: from, len };
+                }
+                self.used.push(i as u32);
+                if self.used.len() * 2 > self.slots.len() {
+                    self.grow();
+                }
+                return;
+            }
+            if s.hash == h32
+                && s.len == len
+                && unsafe { bytes.get_unchecked(s.start as usize..(s.start + s.len) as usize) } == key
+            {
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
     pub fn contains(&self, src: &Src<'_>, from: u32, to: u32) -> bool {
         if self.used.is_empty() {
             return false;
         }
         let len = to - from;
         if src.is_ascii() {
-            let bytes = src.text.as_bytes();
-            let key = unsafe { bytes.get_unchecked(from as usize..to as usize) };
-            let h32 = hash_name_u8(key);
-            let mut i = probe_start(h32, self.mask);
-            loop {
-                let s = unsafe { *self.slots.get_unchecked(i) };
-                if s.start == EMPTY_SLOT {
-                    return false;
-                }
-                if s.hash == h32
-                    && s.len == len
-                    && unsafe { bytes.get_unchecked(s.start as usize..(s.start + s.len) as usize) } == key
-                {
-                    return true;
-                }
-                i = (i + 1) & self.mask;
-            }
+            self.contains_bytes(src.text.as_bytes(), from, to)
         } else {
             let units = src.units_slice();
             let key = &units[from as usize..to as usize];
@@ -430,30 +466,7 @@ impl NameSet {
     pub fn insert(&mut self, src: &Src<'_>, from: u32, to: u32) {
         let len = to - from;
         if src.is_ascii() {
-            let bytes = src.text.as_bytes();
-            let key = unsafe { bytes.get_unchecked(from as usize..to as usize) };
-            let h32 = hash_name_u8(key);
-            let mut i = probe_start(h32, self.mask);
-            loop {
-                let s = unsafe { *self.slots.get_unchecked(i) };
-                if s.start == EMPTY_SLOT {
-                    unsafe {
-                        *self.slots.get_unchecked_mut(i) = NameSlot { hash: h32, start: from, len };
-                    }
-                    self.used.push(i as u32);
-                    if self.used.len() * 2 > self.slots.len() {
-                        self.grow();
-                    }
-                    return;
-                }
-                if s.hash == h32
-                    && s.len == len
-                    && unsafe { bytes.get_unchecked(s.start as usize..(s.start + s.len) as usize) } == key
-                {
-                    return;
-                }
-                i = (i + 1) & self.mask;
-            }
+            self.insert_bytes(src.text.as_bytes(), from, to);
         } else {
             let units = src.units_slice();
             let key = &units[from as usize..to as usize];
