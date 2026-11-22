@@ -3,6 +3,8 @@
 //! directly; others carry their UTF-16 units and a unit -> byte offset map.
 //! Buffers are reusable via `SrcBuf` to eliminate per-file allocations.
 
+use std::collections::HashSet;
+
 use crate::lezer::{self, Grammar, SyntaxTree};
 
 /// JavaScript's `\s` (WhiteSpace and LineTerminator), on a UTF-16 code unit.
@@ -92,6 +94,34 @@ pub(crate) struct Src<'a> {
     line_starts: &'a [u32],
 }
 
+/// Monotonic O(1) cursor-assisted 1-based line lookup over byte/unit `line_starts`.
+#[inline(always)]
+pub(crate) fn line_of_cursor(ls: &[u32], offset: u32, cur: &mut usize) -> u32 {
+    let n = ls.len();
+    let mut i = *cur;
+    if i < n && unsafe { *ls.get_unchecked(i) } <= offset {
+        if i + 1 == n || offset < unsafe { *ls.get_unchecked(i + 1) } {
+            return (i + 1) as u32;
+        }
+        i += 1;
+        if i + 1 == n || offset < unsafe { *ls.get_unchecked(i + 1) } {
+            *cur = i;
+            return (i + 1) as u32;
+        }
+        let limit = (i + 4).min(n);
+        while i + 1 < limit && unsafe { *ls.get_unchecked(i + 1) } <= offset {
+            i += 1;
+        }
+        if i + 1 == n || offset < unsafe { *ls.get_unchecked(i + 1) } {
+            *cur = i;
+            return (i + 1) as u32;
+        }
+    }
+    let idx = ls.partition_point(|&s| s <= offset).saturating_sub(1);
+    *cur = idx;
+    (idx + 1) as u32
+}
+
 impl<'a> Src<'a> {
     pub fn build(text: &'a str, buf: &'a mut SrcBuf) -> Self {
         buf.line_starts.clear();
@@ -173,30 +203,45 @@ impl<'a> Src<'a> {
     /// Monotonic O(1) cursor-assisted 1-based line lookup (for DFS token emission).
     #[inline(always)]
     pub fn line_of_cursor(&self, offset: u32, cur: &mut usize) -> u32 {
-        let ls = self.line_starts;
-        let n = ls.len();
-        let mut i = *cur;
-        if i < n && unsafe { *ls.get_unchecked(i) } <= offset {
-            if i + 1 == n || offset < unsafe { *ls.get_unchecked(i + 1) } {
-                return (i + 1) as u32;
-            }
-            i += 1;
-            if i + 1 == n || offset < unsafe { *ls.get_unchecked(i + 1) } {
-                *cur = i;
-                return (i + 1) as u32;
-            }
-            let limit = (i + 4).min(n);
-            while i + 1 < limit && unsafe { *ls.get_unchecked(i + 1) } <= offset {
-                i += 1;
-            }
-            if i + 1 == n || offset < unsafe { *ls.get_unchecked(i + 1) } {
-                *cur = i;
-                return (i + 1) as u32;
+        line_of_cursor(self.line_starts, offset, cur)
+    }
+
+    /// 1-based `(start_line, end_line)` span trimming trailing JavaScript whitespace.
+    #[inline]
+    pub fn line_span(&self, from: u32, to: u32) -> (u32, u32) {
+        let mut end = to;
+        while end > from + 1 && js_ws(self.unit(end - 1)) {
+            end -= 1;
+        }
+        (self.line_of(from), self.line_of(end.saturating_sub(1)))
+    }
+
+    /// True if identifier range `from..to` looks like an external/global symbol.
+    #[inline]
+    pub fn looks_global(&self, from: u32, to: u32, globals: Option<&HashSet<String>>) -> bool {
+        if from < to {
+            let first = self.unit(from);
+            if (b'A' as u32..=b'Z' as u32).contains(&first) {
+                return true;
             }
         }
-        let idx = ls.partition_point(|&s| s <= offset).saturating_sub(1);
-        *cur = idx;
-        (idx + 1) as u32
+        if let Some(g) = globals {
+            match self.str_range(from, to) {
+                Some(s) => g.contains(s),
+                None => g.contains(&self.string(from, to)),
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Appends source text for unit span `(from, to)` onto `out`.
+    #[inline]
+    pub fn push_span(&self, span: (u32, u32), out: &mut String) {
+        match self.str_range(span.0, span.1) {
+            Some(s) => out.push_str(s),
+            None => out.push_str(&self.string(span.0, span.1)),
+        }
     }
 
     /// The source text between two unit offsets, if both fall on character boundaries.
@@ -349,6 +394,38 @@ impl Default for NameSet {
     }
 }
 
+trait NameBuf: Copy {
+    fn hash_slice(self, from: u32, to: u32) -> u32;
+    fn eq_slot(self, s: NameSlot, from: u32, to: u32) -> bool;
+}
+
+impl NameBuf for &[u8] {
+    #[inline(always)]
+    fn hash_slice(self, from: u32, to: u32) -> u32 {
+        hash_name_u8(unsafe { self.get_unchecked(from as usize..to as usize) })
+    }
+
+    #[inline(always)]
+    fn eq_slot(self, s: NameSlot, from: u32, to: u32) -> bool {
+        unsafe {
+            self.get_unchecked(s.start as usize..(s.start + s.len) as usize)
+                == self.get_unchecked(from as usize..to as usize)
+        }
+    }
+}
+
+impl NameBuf for &[u16] {
+    #[inline(always)]
+    fn hash_slice(self, from: u32, to: u32) -> u32 {
+        hash_name_u16(&self[from as usize..to as usize])
+    }
+
+    #[inline(always)]
+    fn eq_slot(self, s: NameSlot, from: u32, to: u32) -> bool {
+        self[s.start as usize..(s.start + s.len) as usize] == self[from as usize..to as usize]
+    }
+}
+
 impl NameSet {
     pub fn new() -> Self {
         Self {
@@ -382,23 +459,16 @@ impl NameSet {
     }
 
     #[inline(always)]
-    pub fn contains_bytes(&self, bytes: &[u8], from: u32, to: u32) -> bool {
-        if self.used.is_empty() {
-            return false;
-        }
+    fn contains_in<B: NameBuf>(&self, buf: B, from: u32, to: u32) -> bool {
         let len = to - from;
-        let key = unsafe { bytes.get_unchecked(from as usize..to as usize) };
-        let h32 = hash_name_u8(key);
+        let h32 = buf.hash_slice(from, to);
         let mut i = probe_start(h32, self.mask);
         loop {
             let s = unsafe { *self.slots.get_unchecked(i) };
             if s.start == EMPTY_SLOT {
                 return false;
             }
-            if s.hash == h32
-                && s.len == len
-                && unsafe { bytes.get_unchecked(s.start as usize..(s.start + s.len) as usize) } == key
-            {
+            if s.hash == h32 && s.len == len && buf.eq_slot(s, from, to) {
                 return true;
             }
             i = (i + 1) & self.mask;
@@ -406,10 +476,9 @@ impl NameSet {
     }
 
     #[inline(always)]
-    pub fn insert_bytes(&mut self, bytes: &[u8], from: u32, to: u32) {
+    fn insert_in<B: NameBuf>(&mut self, buf: B, from: u32, to: u32) {
         let len = to - from;
-        let key = unsafe { bytes.get_unchecked(from as usize..to as usize) };
-        let h32 = hash_name_u8(key);
+        let h32 = buf.hash_slice(from, to);
         let mut i = probe_start(h32, self.mask);
         loop {
             let s = unsafe { *self.slots.get_unchecked(i) };
@@ -423,10 +492,7 @@ impl NameSet {
                 }
                 return;
             }
-            if s.hash == h32
-                && s.len == len
-                && unsafe { bytes.get_unchecked(s.start as usize..(s.start + s.len) as usize) } == key
-            {
+            if s.hash == h32 && s.len == len && buf.eq_slot(s, from, to) {
                 return;
             }
             i = (i + 1) & self.mask;
@@ -434,64 +500,33 @@ impl NameSet {
     }
 
     #[inline(always)]
+    pub fn contains_bytes(&self, bytes: &[u8], from: u32, to: u32) -> bool {
+        !self.used.is_empty() && self.contains_in(bytes, from, to)
+    }
+
+    #[inline(always)]
+    pub fn insert_bytes(&mut self, bytes: &[u8], from: u32, to: u32) {
+        self.insert_in(bytes, from, to);
+    }
+
+    #[inline(always)]
     pub fn contains(&self, src: &Src<'_>, from: u32, to: u32) -> bool {
         if self.used.is_empty() {
             return false;
         }
-        let len = to - from;
         if src.is_ascii() {
-            self.contains_bytes(src.text.as_bytes(), from, to)
+            self.contains_in(src.text.as_bytes(), from, to)
         } else {
-            let units = src.units_slice();
-            let key = &units[from as usize..to as usize];
-            let h32 = hash_name_u16(key);
-            let mut i = probe_start(h32, self.mask);
-            loop {
-                let s = unsafe { *self.slots.get_unchecked(i) };
-                if s.start == EMPTY_SLOT {
-                    return false;
-                }
-                if s.hash == h32
-                    && s.len == len
-                    && &units[s.start as usize..(s.start + s.len) as usize] == key
-                {
-                    return true;
-                }
-                i = (i + 1) & self.mask;
-            }
+            self.contains_in(src.units_slice(), from, to)
         }
     }
 
     #[inline]
     pub fn insert(&mut self, src: &Src<'_>, from: u32, to: u32) {
-        let len = to - from;
         if src.is_ascii() {
-            self.insert_bytes(src.text.as_bytes(), from, to);
+            self.insert_in(src.text.as_bytes(), from, to);
         } else {
-            let units = src.units_slice();
-            let key = &units[from as usize..to as usize];
-            let h32 = hash_name_u16(key);
-            let mut i = probe_start(h32, self.mask);
-            loop {
-                let s = unsafe { *self.slots.get_unchecked(i) };
-                if s.start == EMPTY_SLOT {
-                    unsafe {
-                        *self.slots.get_unchecked_mut(i) = NameSlot { hash: h32, start: from, len };
-                    }
-                    self.used.push(i as u32);
-                    if self.used.len() * 2 > self.slots.len() {
-                        self.grow();
-                    }
-                    return;
-                }
-                if s.hash == h32
-                    && s.len == len
-                    && &units[s.start as usize..(s.start + s.len) as usize] == key
-                {
-                    return;
-                }
-                i = (i + 1) & self.mask;
-            }
+            self.insert_in(src.units_slice(), from, to);
         }
     }
 

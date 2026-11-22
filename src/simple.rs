@@ -36,35 +36,6 @@ const DK2: u64 = 0xc2b2_ae3d_27d4_eb4f;
 const DK3: u64 = 0x1656_67b1_9e37_79f9;
 
 #[inline(always)]
-fn digest_hash_bytes(b: &[u8]) -> u64 {
-    let len = b.len();
-    if len <= 8 {
-        let mut buf = [0u8; 8];
-        match len {
-            0 => return 0x9e37_79b9_7f4a_7c15,
-            1 => buf[0] = b[0],
-            2 => {
-                buf[0] = b[0];
-                buf[1] = b[1];
-            }
-            3 => {
-                buf[0] = b[0];
-                buf[1] = b[1];
-                buf[2] = b[2];
-            }
-            4 => buf[..4].copy_from_slice(b),
-            5..=7 => buf[..len].copy_from_slice(b),
-            8 => buf.copy_from_slice(b),
-            _ => unreachable!(),
-        }
-        let t = ((u64::from_le_bytes(buf) ^ 0xa076_1d64_78bd_642f) as u128)
-            .wrapping_mul(((len as u64) ^ 0xe703_7ed1_a0b4_28db) as u128);
-        return (t as u64) ^ ((t >> 64) as u64);
-    }
-    xxhash_rust::xxh3::xxh3_64(b)
-}
-
-#[inline(always)]
 fn dg_step(d1: &mut u64, d2: &mut u64, x: u64) {
     *d1 = (d1.rotate_left(23) ^ x).wrapping_mul(DK1);
     *d2 = (d2.rotate_left(31) ^ x.wrapping_mul(DK2)).wrapping_mul(DK3);
@@ -217,7 +188,7 @@ impl Body {
             } else {
                 0x6eu64 << 56
             };
-            let th = digest_hash_bytes(self.text(base, it));
+            let th = crate::features::hash_bytes(self.text(base, it));
             dg_step(d1, d2, th ^ tag);
         }
     }

@@ -71,19 +71,29 @@ pub struct CliError {
 }
 
 impl CliError {
-    pub fn user_input(
+    fn new(
+        kind: ExitKind,
         what: impl Into<String>,
         why: impl Into<String>,
         try_cmd: impl Into<String>,
         see: impl Into<String>,
     ) -> Self {
         Self {
-            kind: ExitKind::UserInput,
+            kind,
             what: what.into(),
             why: why.into(),
             try_cmd: try_cmd.into(),
             see: see.into(),
         }
+    }
+
+    pub fn user_input(
+        what: impl Into<String>,
+        why: impl Into<String>,
+        try_cmd: impl Into<String>,
+        see: impl Into<String>,
+    ) -> Self {
+        Self::new(ExitKind::UserInput, what, why, try_cmd, see)
     }
 
     pub fn tool_env(
@@ -92,13 +102,7 @@ impl CliError {
         try_cmd: impl Into<String>,
         see: impl Into<String>,
     ) -> Self {
-        Self {
-            kind: ExitKind::ToolEnv,
-            what: what.into(),
-            why: why.into(),
-            try_cmd: try_cmd.into(),
-            see: see.into(),
-        }
+        Self::new(ExitKind::ToolEnv, what, why, try_cmd, see)
     }
 
     pub fn render(&self) -> String {

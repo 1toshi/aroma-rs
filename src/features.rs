@@ -101,7 +101,7 @@ fn mix(h: u64, x: u64) -> u64 {
 }
 
 #[inline(always)]
-fn hash_bytes(b: &[u8]) -> u64 {
+pub(crate) fn hash_bytes(b: &[u8]) -> u64 {
     let len = b.len();
     if len <= 8 {
         let mut buf = [0u8; 8];

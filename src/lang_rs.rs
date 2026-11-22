@@ -5,9 +5,9 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 
-use crate::lang_py::FastMethod;
+use crate::lang_py::{collect_parsed_methods, FastMethod};
 use crate::simple::{Body, KW, NAME};
-use crate::text::NameSet;
+use crate::text::{line_of_cursor, NameSet};
 use crate::{Language, Node, ParsedMethod, SnippetOptions};
 
 const MAX_DEPTH: usize = 128;
@@ -644,33 +644,6 @@ fn line_of(ls: &[u32], offset: u32) -> u32 {
     ls.partition_point(|&s| s <= offset) as u32
 }
 
-#[inline(always)]
-fn line_of_cursor(ls: &[u32], offset: u32, cur: &mut usize) -> u32 {
-    let n = ls.len();
-    let mut i = *cur;
-    if i < n && unsafe { *ls.get_unchecked(i) } <= offset {
-        if i + 1 == n || offset < unsafe { *ls.get_unchecked(i + 1) } {
-            return (i + 1) as u32;
-        }
-        i += 1;
-        if i + 1 == n || offset < unsafe { *ls.get_unchecked(i + 1) } {
-            *cur = i;
-            return (i + 1) as u32;
-        }
-        let limit = (i + 4).min(n);
-        while i + 1 < limit && unsafe { *ls.get_unchecked(i + 1) } <= offset {
-            i += 1;
-        }
-        if i + 1 == n || offset < unsafe { *ls.get_unchecked(i + 1) } {
-            *cur = i;
-            return (i + 1) as u32;
-        }
-    }
-    let idx = ls.partition_point(|&s| s <= offset).saturating_sub(1);
-    *cur = idx;
-    (idx + 1) as u32
-}
-
 #[inline]
 fn tok_bytes(bytes: &[u8], t: RsTok) -> &[u8] {
     &bytes[t.start as usize..t.end as usize]
@@ -801,19 +774,21 @@ fn skip_angles(toks: &[RsTok], lt_idx: usize, limit: usize) -> usize {
 }
 
 #[inline]
-fn is_contiguous_shr(toks: &[RsTok], i: usize, limit: usize) -> bool {
+fn is_contiguous_pair(toks: &[RsTok], i: usize, limit: usize, first: TK, second: TK) -> bool {
     i + 1 < limit
-        && toks[i].kind == TK::Gt
-        && toks[i + 1].kind == TK::Gt
+        && toks[i].kind == first
+        && toks[i + 1].kind == second
         && toks[i].end == toks[i + 1].start
 }
 
 #[inline]
+fn is_contiguous_shr(toks: &[RsTok], i: usize, limit: usize) -> bool {
+    is_contiguous_pair(toks, i, limit, TK::Gt, TK::Gt)
+}
+
+#[inline]
 fn is_contiguous_shr_eq(toks: &[RsTok], i: usize, limit: usize) -> bool {
-    i + 1 < limit
-        && toks[i].kind == TK::Gt
-        && toks[i + 1].kind == TK::Ge
-        && toks[i].end == toks[i + 1].start
+    is_contiguous_pair(toks, i, limit, TK::Gt, TK::Ge)
 }
 
 // ============================================================================
@@ -2903,18 +2878,9 @@ impl Language for RustLanguage {
     }
 
     fn parse_methods(&self, source: &str, _path: &str) -> Vec<ParsedMethod> {
-        let mut body = Body::default();
-        let mut raw = Vec::new();
-        parse_methods_into(source, None, &mut body, &mut raw);
-        let base = source.as_bytes();
-        raw.into_iter()
-            .map(|m| ParsedMethod {
-                name: m.name,
-                start_line: m.start_line,
-                end_line: m.end_line,
-                body: body.to_node(base, m.body_root),
-            })
-            .collect()
+        collect_parsed_methods(source, |body, raw| {
+            parse_methods_into(source, None, body, raw);
+        })
     }
 
     fn parse_snippet(&self, source: &str, options: &SnippetOptions) -> Option<Node> {

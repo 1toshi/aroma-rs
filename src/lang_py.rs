@@ -3,12 +3,11 @@
 //! peak worker RSS), single-byte `kind` dispatch table, and zero-alloc `NameSet`.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use crate::lezer::{self, SyntaxTree, NONE};
+use crate::lezer::{self, Grammar, SyntaxTree, NONE};
 use crate::simple::{Body, Cfg, Simplifier};
-use crate::text::{dedent_source, js_ws, NameSet, Src, SrcBuf};
+use crate::text::{dedent_source, NameSet, Src, SrcBuf};
 use crate::{Language, Node, ParsedMethod, SnippetOptions};
 
 /// Shared per-worker scratch for both Python and TypeScript front-ends.
@@ -136,32 +135,6 @@ fn tables() -> &'static PyTables {
 #[inline(always)]
 fn kind_of(t: &PyTables, tree: &SyntaxTree, n: u32) -> u8 {
     unsafe { *t.kind.get_unchecked(tree.ty(n) as usize) }
-}
-
-fn line_span(src: &Src<'_>, from: u32, to: u32) -> (u32, u32) {
-    let mut end = to;
-    while end > from + 1 && js_ws(src.unit(end - 1)) {
-        end -= 1;
-    }
-    (src.line_of(from), src.line_of(end.saturating_sub(1)))
-}
-
-#[inline]
-fn looks_global(src: &Src<'_>, from: u32, to: u32, globals: Option<&HashSet<String>>) -> bool {
-    if from < to {
-        let first = src.unit(from);
-        if (b'A' as u32..=b'Z' as u32).contains(&first) {
-            return true;
-        }
-    }
-    if let Some(g) = globals {
-        match src.str_range(from, to) {
-            Some(s) => g.contains(s),
-            None => g.contains(&src.string(from, to)),
-        }
-    } else {
-        false
-    }
 }
 
 #[inline(always)]
@@ -366,19 +339,29 @@ fn span_after(t: &PyTables, tree: &SyntaxTree, parent: u32, kw: u8) -> (u32, u32
     (0, 0)
 }
 
-#[inline]
-fn push_src_span(src: &Src<'_>, span: (u32, u32), out: &mut String) {
-    match src.str_range(span.0, span.1) {
-        Some(s) => out.push_str(s),
-        None => out.push_str(&src.string(span.0, span.1)),
-    }
-}
-
 pub(crate) struct FastMethod {
     pub name: String,
     pub start_line: u32,
     pub end_line: u32,
     pub body_root: u32,
+}
+
+pub(crate) fn collect_parsed_methods(
+    source: &str,
+    parse: impl FnOnce(&mut Body, &mut Vec<FastMethod>),
+) -> Vec<ParsedMethod> {
+    let mut body = Body::default();
+    let mut raw = Vec::new();
+    parse(&mut body, &mut raw);
+    let base = source.as_bytes();
+    raw.into_iter()
+        .map(|m| ParsedMethod {
+            name: m.name,
+            start_line: m.start_line,
+            end_line: m.end_line,
+            body: body.to_node(base, m.body_root),
+        })
+        .collect()
 }
 
 /// Parses a Python file directly into a reusable `Body` arena, returning
@@ -419,7 +402,7 @@ pub(crate) fn parse_methods_into(
                         return;
                     }
                     let (start_line, end_line) = if let Some((min_ln, max_ln)) = line_range {
-                        let (sl, el) = line_span(src, tree.from(n), tree.to(n));
+                        let (sl, el) = src.line_span(tree.from(n), tree.to(n));
                         if el < min_ln || sl > max_ln {
                             return;
                         }
@@ -450,16 +433,16 @@ pub(crate) fn parse_methods_into(
                         } else {
                             let mut s = String::new();
                             for &cs in classes.iter() {
-                                push_src_span(src, cs, &mut s);
+                                src.push_span(cs, &mut s);
                                 s.push('.');
                             }
-                            push_src_span(src, fn_span, &mut s);
+                            src.push_span(fn_span, &mut s);
                             s
                         };
                         let (sl, el) = if line_range.is_some() {
                             (start_line, end_line)
                         } else {
-                            line_span(src, tree.from(n), tree.to(n))
+                            src.line_span(tree.from(n), tree.to(n))
                         };
                         out.push(FastMethod { name, start_line: sl, end_line: el, body_root: root });
                     }
@@ -489,6 +472,32 @@ pub(crate) fn parse_methods_into(
     });
 }
 
+pub(crate) fn simplify_lezer_snippet(
+    source: &str,
+    grammar: &'static Grammar,
+    cfg: &Cfg,
+    body: &mut Body,
+    collect_names: impl FnOnce(&Src<'_>, &SyntaxTree, &mut NameSet, &mut NameSet),
+    is_local: impl Fn(&Src<'_>, &SyntaxTree, &NameSet, &NameSet, u32) -> bool,
+) -> Option<u32> {
+    TL_FRONT.with(|cell| {
+        let mut sc = cell.borrow_mut();
+        let FrontScratch { tree, src_buf, set_a, set_b, .. } = &mut *sc;
+        let src = Src::build(source, src_buf);
+        src.parse_into(grammar, tree);
+        collect_names(&src, tree, set_a, set_b);
+        let a = &*set_a;
+        let b = &*set_b;
+        let simp = Simplifier {
+            src: &src,
+            tree,
+            cfg,
+            is_local: |node| is_local(&src, tree, a, b, node),
+        };
+        simp.run(body, 0)
+    })
+}
+
 /// Parses a Python snippet into `body`. Returns `(root, dedented_source)` so
 /// token spans referencing `dedented_source` remain valid.
 pub(crate) fn parse_snippet_into(
@@ -498,37 +507,29 @@ pub(crate) fn parse_snippet_into(
 ) -> Option<(u32, String)> {
     let t = tables();
     let dedented = dedent_source(source);
-    let root = TL_FRONT.with(|cell| {
-        let mut sc = cell.borrow_mut();
-        let FrontScratch { tree, src_buf, set_a, set_b, .. } = &mut *sc;
-        let src = Src::build(&dedented, src_buf);
-        src.parse_into(&lezer::PYTHON, tree);
-        names_under(t, &src, tree, 0, set_a, set_b);
-        let bound = &*set_a;
-        let outer = &*set_b;
-        let globals = options.globals.as_ref();
-        let simp = Simplifier {
-            src: &src,
-            tree,
-            cfg: &t.cfg,
-            is_local: |node| {
-                if kind_of(t, tree, node) != K_VAR {
-                    return false;
-                }
-                let (a, b) = (tree.from(node), tree.to(node));
-                if outer.contains(&src, a, b) {
-                    return false;
-                }
-                if bound.contains(&src, a, b) {
-                    return !is_keyword_arg(t, tree, node);
-                }
-                !(looks_global(&src, a, b, globals)
-                    || is_keyword_arg(t, tree, node)
-                    || is_callee(t, tree, node))
-            },
-        };
-        simp.run(body, 0)
-    })?;
+    let globals = options.globals.as_ref();
+    let root = simplify_lezer_snippet(
+        &dedented,
+        &lezer::PYTHON,
+        &t.cfg,
+        body,
+        |src, tree, bound, outer| names_under(t, src, tree, 0, bound, outer),
+        |src, tree, bound, outer, node| {
+            if kind_of(t, tree, node) != K_VAR {
+                return false;
+            }
+            let (a, b) = (tree.from(node), tree.to(node));
+            if outer.contains(src, a, b) {
+                return false;
+            }
+            if bound.contains(src, a, b) {
+                return !is_keyword_arg(t, tree, node);
+            }
+            !(src.looks_global(a, b, globals)
+                || is_keyword_arg(t, tree, node)
+                || is_callee(t, tree, node))
+        },
+    )?;
     Some((root, dedented))
 }
 
@@ -544,18 +545,9 @@ impl Language for PythonLanguage {
     }
 
     fn parse_methods(&self, source: &str, _path: &str) -> Vec<ParsedMethod> {
-        let mut body = Body::default();
-        let mut raw = Vec::new();
-        parse_methods_into(source, None, &mut body, &mut raw);
-        let base = source.as_bytes();
-        raw.into_iter()
-            .map(|m| ParsedMethod {
-                name: m.name,
-                start_line: m.start_line,
-                end_line: m.end_line,
-                body: body.to_node(base, m.body_root),
-            })
-            .collect()
+        collect_parsed_methods(source, |body, raw| {
+            parse_methods_into(source, None, body, raw);
+        })
     }
 
     fn parse_snippet(&self, source: &str, options: &SnippetOptions) -> Option<Node> {

@@ -16,8 +16,7 @@ use crate::index::{
     AromaIndex, LanguageIndex, MethodLocation, Query, COUNT_OVERFLOW, COUNT_SHIFT, MID_MASK,
 };
 use crate::prune::{
-    prune_fast, prune_fast_into, prune_with_fast_map, prune_with_fast_map_into, FastQueryMap,
-    PruneScratch, PruneTarget, Pruned,
+    prune_query, prune_query_into, FastQueryMap, PruneQuery, PruneScratch, PruneTarget, Pruned,
 };
 use crate::MethodRef;
 
@@ -540,8 +539,11 @@ pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) ->
         if !use_fast {
             sc.prune_target.build_from_pairs(&query.features);
         }
-        let qmap = &sc.fast_qmap;
-        let ptarget = &sc.prune_target;
+        let pq = if use_fast {
+            PruneQuery::Fast(&sc.fast_qmap)
+        } else {
+            PruneQuery::Target(&sc.prune_target)
+        };
 
         let results = if rayon::current_thread_index().is_none()
             && let Some(pool) = index.pool.as_ref()
@@ -556,29 +558,16 @@ pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) ->
                             let (ps, kept) = &mut *pcell.borrow_mut();
                             let m = &lidx.methods[cand.mid as usize];
                             let offsets = lidx.method_offsets(cand.mid as usize);
-                            let score = if use_fast {
-                                prune_with_fast_map_into(
-                                    qmap,
-                                    &lidx.all_features,
-                                    offsets,
-                                    m.feat_start as usize,
-                                    Some(cand.score as usize),
-                                    None,
-                                    ps,
-                                    kept,
-                                )
-                            } else {
-                                prune_fast_into(
-                                    ptarget,
-                                    &lidx.all_features,
-                                    offsets,
-                                    m.feat_start as usize,
-                                    Some(cand.score as usize),
-                                    None,
-                                    ps,
-                                    kept,
-                                )
-                            };
+                            let score = prune_query_into(
+                                pq,
+                                &lidx.all_features,
+                                offsets,
+                                m.feat_start as usize,
+                                Some(cand.score as usize),
+                                None,
+                                ps,
+                                kept,
+                            );
                             debug_assert_eq!(score, cand.score as usize);
                             let matched_lines = matched_lines_of(lidx, cand.loc, kept);
                             SearchResult {
@@ -595,29 +584,16 @@ pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) ->
             for cand in survivors {
                 let m = &lidx.methods[cand.mid as usize];
                 let offsets = lidx.method_offsets(cand.mid as usize);
-                let score = if use_fast {
-                    prune_with_fast_map_into(
-                        qmap,
-                        &lidx.all_features,
-                        offsets,
-                        m.feat_start as usize,
-                        Some(cand.score as usize),
-                        None,
-                        &mut sc.prune_scratch,
-                        &mut sc.kept_buf,
-                    )
-                } else {
-                    prune_fast_into(
-                        ptarget,
-                        &lidx.all_features,
-                        offsets,
-                        m.feat_start as usize,
-                        Some(cand.score as usize),
-                        None,
-                        &mut sc.prune_scratch,
-                        &mut sc.kept_buf,
-                    )
-                };
+                let score = prune_query_into(
+                    pq,
+                    &lidx.all_features,
+                    offsets,
+                    m.feat_start as usize,
+                    Some(cand.score as usize),
+                    None,
+                    &mut sc.prune_scratch,
+                    &mut sc.kept_buf,
+                );
                 debug_assert_eq!(score, cand.score as usize);
                 let matched_lines = matched_lines_of(lidx, cand.loc, &sc.kept_buf);
                 out.push(SearchResult {
@@ -671,8 +647,11 @@ pub(crate) fn rank_for_recommend<'a>(
     if !use_fast {
         sc.prune_target.build_from_pairs(&query.features);
     }
-    let qmap = &sc.fast_qmap;
-    let ptarget = &sc.prune_target;
+    let pq = if use_fast {
+        PruneQuery::Fast(&sc.fast_qmap)
+    } else {
+        PruneQuery::Target(&sc.prune_target)
+    };
 
     let out = if rayon::current_thread_index().is_none()
         && let Some(pool) = index.pool.as_ref()
@@ -687,27 +666,15 @@ pub(crate) fn rank_for_recommend<'a>(
                         let (ps, _) = &mut *pcell.borrow_mut();
                         let m = &lidx.methods[cand.mid as usize];
                         let offsets = lidx.method_offsets(cand.mid as usize);
-                        let pruned = if use_fast {
-                            prune_with_fast_map(
-                                qmap,
-                                &lidx.all_features,
-                                offsets,
-                                m.feat_start as usize,
-                                Some(cand.score as usize),
-                                None,
-                                ps,
-                            )
-                        } else {
-                            prune_fast(
-                                ptarget,
-                                &lidx.all_features,
-                                offsets,
-                                m.feat_start as usize,
-                                Some(cand.score as usize),
-                                None,
-                                ps,
-                            )
-                        };
+                        let pruned = prune_query(
+                            pq,
+                            &lidx.all_features,
+                            offsets,
+                            m.feat_start as usize,
+                            Some(cand.score as usize),
+                            None,
+                            ps,
+                        );
                         debug_assert_eq!(pruned.score, cand.score as usize);
                         RankedCandidate { mid: cand.mid, loc: cand.loc, pruned }
                     })
@@ -719,27 +686,15 @@ pub(crate) fn rank_for_recommend<'a>(
         for cand in survivors {
             let m = &lidx.methods[cand.mid as usize];
             let offsets = lidx.method_offsets(cand.mid as usize);
-            let pruned = if use_fast {
-                prune_with_fast_map(
-                    qmap,
-                    &lidx.all_features,
-                    offsets,
-                    m.feat_start as usize,
-                    Some(cand.score as usize),
-                    None,
-                    &mut sc.prune_scratch,
-                )
-            } else {
-                prune_fast(
-                    ptarget,
-                    &lidx.all_features,
-                    offsets,
-                    m.feat_start as usize,
-                    Some(cand.score as usize),
-                    None,
-                    &mut sc.prune_scratch,
-                )
-            };
+            let pruned = prune_query(
+                pq,
+                &lidx.all_features,
+                offsets,
+                m.feat_start as usize,
+                Some(cand.score as usize),
+                None,
+                &mut sc.prune_scratch,
+            );
             debug_assert_eq!(pruned.score, cand.score as usize);
             out.push(RankedCandidate { mid: cand.mid, loc: cand.loc, pruned });
         }

@@ -123,22 +123,22 @@ pub(crate) struct PruneTarget {
 }
 
 impl PruneTarget {
-    pub fn build_from_pairs(&mut self, pairs: &[(u32, u32)]) {
-        self.reset(pairs.len());
-        for &(k, cap) in pairs {
+    #[inline]
+    fn build_from_iter(&mut self, len: usize, iter: impl Iterator<Item = (u32, u32)>) {
+        self.reset(len);
+        for (k, cap) in iter {
             if cap > 0 {
                 self.insert(k, cap);
             }
         }
     }
 
+    pub fn build_from_pairs(&mut self, pairs: &[(u32, u32)]) {
+        self.build_from_iter(pairs.len(), pairs.iter().copied());
+    }
+
     pub fn build_from_i32_map(&mut self, map: &HashMap<i32, usize>) {
-        self.reset(map.len());
-        for (&k, &cap) in map {
-            if cap > 0 {
-                self.insert(k as u32, cap as u32);
-            }
-        }
+        self.build_from_iter(map.len(), map.iter().map(|(&k, &cap)| (k as u32, cap as u32)));
     }
 
     fn reset(&mut self, count: usize) {
@@ -604,9 +604,53 @@ fn run_greedy_sig_into(
 
 const SIG_THRESHOLD: usize = 512;
 
-/// Fast Algorithm 1 using 4 KB L1 Bloom + direct L1-hot `qidx[fid]`.
-pub(crate) fn prune_with_fast_map(
-    qmap: &FastQueryMap,
+#[derive(Clone, Copy)]
+pub(crate) enum PruneQuery<'a> {
+    Fast(&'a FastQueryMap),
+    Target(&'a PruneTarget),
+}
+
+/// Dispatches Phase II pruning to either the fast Bloom/L1 query map or general `PruneTarget`.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) fn prune_query_into(
+    pq: PruneQuery<'_>,
+    all_features: &[u32],
+    offsets: &[u32],
+    feat_base: usize,
+    expected_score: Option<usize>,
+    candidates: Option<&[usize]>,
+    scratch: &mut PruneScratch,
+    kept: &mut Vec<usize>,
+) -> usize {
+    match pq {
+        PruneQuery::Fast(qmap) => prune_with_fast_map_into(
+            qmap,
+            all_features,
+            offsets,
+            feat_base,
+            expected_score,
+            candidates,
+            scratch,
+            kept,
+        ),
+        PruneQuery::Target(target) => prune_fast_into(
+            target,
+            all_features,
+            offsets,
+            feat_base,
+            expected_score,
+            candidates,
+            scratch,
+            kept,
+        ),
+    }
+}
+
+/// Allocates a pruned token list and returns `Pruned` via `prune_query_into`.
+#[inline(always)]
+pub(crate) fn prune_query(
+    pq: PruneQuery<'_>,
     all_features: &[u32],
     offsets: &[u32],
     feat_base: usize,
@@ -615,8 +659,8 @@ pub(crate) fn prune_with_fast_map(
     scratch: &mut PruneScratch,
 ) -> Pruned {
     let mut tokens = Vec::new();
-    let score = prune_with_fast_map_into(
-        qmap,
+    let score = prune_query_into(
+        pq,
         all_features,
         offsets,
         feat_base,
@@ -1293,18 +1337,15 @@ pub(crate) fn prune_fast(
     candidates: Option<&[usize]>,
     scratch: &mut PruneScratch,
 ) -> Pruned {
-    let mut tokens = Vec::new();
-    let score = prune_fast_into(
-        target,
+    prune_query(
+        PruneQuery::Target(target),
         all_features,
         offsets,
         feat_base,
         expected_score,
         candidates,
         scratch,
-        &mut tokens,
-    );
-    Pruned { tokens, score }
+    )
 }
 
 /// Reusable-buffer version of `prune_fast` eliminating `kept` allocations.

@@ -45,11 +45,7 @@ pub(crate) struct ShardedFeatureTable {
 
 impl ShardedFeatureTable {
     fn new() -> Self {
-        let mut shards = Vec::with_capacity(SHARDS);
-        for _ in 0..SHARDS {
-            shards.push(HashTable::new());
-        }
-        Self { shards }
+        Self::with_shard_capacity(0)
     }
 
     fn with_shard_capacity(cap_per_shard: usize) -> Self {

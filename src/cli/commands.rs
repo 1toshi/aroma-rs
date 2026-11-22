@@ -1349,25 +1349,105 @@ fn missing_lang_error(walk: &WalkResult, subcmd: &str) -> CliError {
     )
 }
 
-pub fn run_search(cmd: &SearchCmd) -> Result<CommandOutcome, CliError> {
+struct QueryRunSpec<'a> {
+    paths: &'a [PathBuf],
+    max_file_bytes: usize,
+    ignores: &'a [String],
+    lang: &'a Option<String>,
+    threads: Option<usize>,
+    query: &'a QuerySource,
+    subcmd: &'static str,
+}
+
+struct QueryRunCtx {
+    walk: WalkResult,
+    index: AromaIndex,
+    corpus: CorpusSummary,
+    resolved: ResolvedQuery,
+    path_str: String,
+}
+
+fn prepare_query_run(spec: QueryRunSpec<'_>) -> Result<QueryRunCtx, CliError> {
     let walk = walk_paths(
-        &cmd.paths,
+        spec.paths,
         &WalkOptions {
-            max_file_bytes: cmd.max_file_bytes,
-            extra_ignores: cmd.ignores.clone(),
-            lang_filter: cmd.lang.clone(),
+            max_file_bytes: spec.max_file_bytes,
+            extra_ignores: spec.ignores.to_vec(),
+            lang_filter: spec.lang.clone(),
         },
     )?;
     let index = build_index(
         &walk.files,
         IndexOptions {
-            threads: cmd.threads,
-            max_file_length: cmd.max_file_bytes,
+            threads: spec.threads,
+            max_file_length: spec.max_file_bytes,
             ..Default::default()
         },
     );
     let corpus = corpus_summary(&walk, &index);
-    let mut rq = resolve_query(&walk, &index, &cmd.query, &cmd.lang, "search")?;
+    let resolved = resolve_query(&walk, &index, spec.query, spec.lang, spec.subcmd)?;
+    let path_str = format_path_args(spec.paths);
+    Ok(QueryRunCtx { walk, index, corpus, resolved, path_str })
+}
+
+fn is_excluded_origin(origin: OriginFilter, q: &Query, m: &MethodRef) -> bool {
+    if origin == OriginFilter::IncludeOrigin {
+        return false;
+    }
+    let Some(ref o) = q.origin else {
+        return false;
+    };
+    m.path == o.path && m.start_line == o.start_line && m.end_line == o.end_line
+}
+
+fn render_query_json<P: Serialize>(
+    ctx: &QueryRunCtx,
+    total: usize,
+    payload: P,
+    commands: &[SuggestedCommand],
+    hint: Option<String>,
+) -> String {
+    #[derive(Serialize)]
+    struct QueryJsonOut<'a, P> {
+        ok: bool,
+        tool_version: &'static str,
+        contract_version: &'static str,
+        data_hash: &'a str,
+        corpus: &'a CorpusSummary,
+        query: &'a QueryMetaOut,
+        total: usize,
+        #[serde(flatten)]
+        payload: P,
+        commands: &'a [SuggestedCommand],
+        warnings: &'a [WarningItem],
+        hint: Option<String>,
+    }
+    let out = QueryJsonOut {
+        ok: true,
+        tool_version: env!("CARGO_PKG_VERSION"),
+        contract_version: "1",
+        data_hash: &ctx.walk.data_hash,
+        corpus: &ctx.corpus,
+        query: &ctx.resolved.meta,
+        total,
+        payload,
+        commands,
+        warnings: &ctx.resolved.warnings,
+        hint,
+    };
+    serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
+}
+
+pub fn run_search(cmd: &SearchCmd) -> Result<CommandOutcome, CliError> {
+    let mut ctx = prepare_query_run(QueryRunSpec {
+        paths: &cmd.paths,
+        max_file_bytes: cmd.max_file_bytes,
+        ignores: &cmd.ignores,
+        lang: &cmd.lang,
+        threads: cmd.threads,
+        query: &cmd.query,
+        subcmd: "search",
+    })?;
 
     #[derive(Serialize)]
     struct HitOut {
@@ -1375,26 +1455,21 @@ pub fn run_search(cmd: &SearchCmd) -> Result<CommandOutcome, CliError> {
         similarity: f64,
         matched_lines: Vec<u32>,
     }
+    #[derive(Serialize)]
+    struct HitsPayload<'a> {
+        hits: &'a [HitOut],
+    }
 
     let mut hits_out: Vec<HitOut> = Vec::new();
-    if let Some(ref q) = rq.query {
-        let exclude_origin = |m: &MethodRef| -> bool {
-            if cmd.origin == OriginFilter::IncludeOrigin {
-                return false;
-            }
-            if let Some(ref o) = q.origin {
-                m.path == o.path && m.start_line == o.start_line && m.end_line == o.end_line
-            } else {
-                false
-            }
-        };
+    if let Some(ref q) = ctx.resolved.query {
+        let exclude_origin = |m: &MethodRef| is_excluded_origin(cmd.origin, q, m);
         let opts = SearchOptions {
             search_limit: cmd.search_limit,
             limit: cmd.top,
             min_similarity: cmd.min_sim,
             exclude: Some(&exclude_origin),
         };
-        for h in search(&index, q, &opts) {
+        for h in search(&ctx.index, q, &opts) {
             hits_out.push(HitOut {
                 method: from_method_ref(&h.method),
                 similarity: round3(h.similarity),
@@ -1403,13 +1478,13 @@ pub fn run_search(cmd: &SearchCmd) -> Result<CommandOutcome, CliError> {
         }
     }
 
-    let path_str = format_path_args(&cmd.paths);
     let mut commands = Vec::new();
     if let Some(first) = hits_out.first() {
         commands.push(SuggestedCommand {
             action: "recommend_top_hit".to_string(),
             command: format!(
-                "aroma recommend {path_str} --file {} --lines {}-{} --json",
+                "aroma recommend {} --file {} --lines {}-{} --json",
+                ctx.path_str,
                 shell_quote(&first.method.path),
                 first.method.start_line,
                 first.method.end_line
@@ -1417,52 +1492,31 @@ pub fn run_search(cmd: &SearchCmd) -> Result<CommandOutcome, CliError> {
             destructive: false,
         });
     }
-    if rq.empty_hint.is_none() && hits_out.is_empty() {
-        rq.empty_hint = Some(format!(
-            "No matches found; try lowering threshold via `aroma search {path_str} --lang {} --min-sim 0.0 --json`",
-            rq.meta.language
-        ));
-    }
+    let hint = ctx.resolved.empty_hint.take().or_else(|| {
+        hits_out.is_empty().then(|| {
+            format!(
+                "No matches found; try lowering threshold via `aroma search {} --lang {} --min-sim 0.0 --json`",
+                ctx.path_str, ctx.resolved.meta.language
+            )
+        })
+    });
 
     let stdout = match cmd.mode {
-        OutputMode::Json => {
-            #[derive(Serialize)]
-            struct SearchOut<'a> {
-                ok: bool,
-                tool_version: &'static str,
-                contract_version: &'static str,
-                data_hash: &'a str,
-                corpus: &'a CorpusSummary,
-                query: &'a QueryMetaOut,
-                total: usize,
-                hits: &'a [HitOut],
-                commands: &'a [SuggestedCommand],
-                warnings: &'a [WarningItem],
-                hint: Option<String>,
-            }
-            let out = SearchOut {
-                ok: true,
-                tool_version: env!("CARGO_PKG_VERSION"),
-                contract_version: "1",
-                data_hash: &walk.data_hash,
-                corpus: &corpus,
-                query: &rq.meta,
-                total: hits_out.len(),
-                hits: &hits_out,
-                commands: &commands,
-                warnings: &rq.warnings,
-                hint: rq.empty_hint,
-            };
-            serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
-        }
+        OutputMode::Json => render_query_json(
+            &ctx,
+            hits_out.len(),
+            HitsPayload { hits: &hits_out },
+            &commands,
+            hint,
+        ),
         OutputMode::Human => {
             let mut txt = format!(
                 "aroma search: {} hit(s) (lang={}, query_size={})\n",
                 hits_out.len(),
-                rq.meta.language,
-                rq.meta.size
+                ctx.resolved.meta.language,
+                ctx.resolved.meta.size
             );
-            if let Some(ref h) = rq.empty_hint {
+            if let Some(ref h) = hint {
                 txt.push_str(&format!("hint: {h}\n"));
             }
             for (i, hit) in hits_out.iter().enumerate() {
@@ -1484,29 +1538,20 @@ pub fn run_search(cmd: &SearchCmd) -> Result<CommandOutcome, CliError> {
     Ok(CommandOutcome {
         exit: ExitKind::Success,
         stdout,
-        stderr_notes: rq.notes,
+        stderr_notes: ctx.resolved.notes,
     })
 }
 
 pub fn run_recommend(cmd: &RecommendCmd) -> Result<CommandOutcome, CliError> {
-    let walk = walk_paths(
-        &cmd.paths,
-        &WalkOptions {
-            max_file_bytes: cmd.max_file_bytes,
-            extra_ignores: cmd.ignores.clone(),
-            lang_filter: cmd.lang.clone(),
-        },
-    )?;
-    let index = build_index(
-        &walk.files,
-        IndexOptions {
-            threads: cmd.threads,
-            max_file_length: cmd.max_file_bytes,
-            ..Default::default()
-        },
-    );
-    let corpus = corpus_summary(&walk, &index);
-    let mut rq = resolve_query(&walk, &index, &cmd.query, &cmd.lang, "recommend")?;
+    let mut ctx = prepare_query_run(QueryRunSpec {
+        paths: &cmd.paths,
+        max_file_bytes: cmd.max_file_bytes,
+        ignores: &cmd.ignores,
+        lang: &cmd.lang,
+        threads: cmd.threads,
+        query: &cmd.query,
+        subcmd: "recommend",
+    })?;
 
     #[derive(Serialize)]
     struct LineOut {
@@ -1523,19 +1568,14 @@ pub fn run_recommend(cmd: &RecommendCmd) -> Result<CommandOutcome, CliError> {
         lines: Vec<LineOut>,
         code: String,
     }
+    #[derive(Serialize)]
+    struct RecsPayload<'a> {
+        recommendations: &'a [RecOut],
+    }
 
     let mut recs_out: Vec<RecOut> = Vec::new();
-    if let Some(ref q) = rq.query {
-        let exclude_origin = |m: &MethodRef| -> bool {
-            if cmd.origin == OriginFilter::IncludeOrigin {
-                return false;
-            }
-            if let Some(ref o) = q.origin {
-                m.path == o.path && m.start_line == o.start_line && m.end_line == o.end_line
-            } else {
-                false
-            }
-        };
+    if let Some(ref q) = ctx.resolved.query {
+        let exclude_origin = |m: &MethodRef| is_excluded_origin(cmd.origin, q, m);
         let opts = RecommendOptions {
             search_limit: cmd.search_limit,
             cluster_limit: cmd.cluster_limit,
@@ -1545,7 +1585,7 @@ pub fn run_recommend(cmd: &RecommendCmd) -> Result<CommandOutcome, CliError> {
             exclude: Some(&exclude_origin),
             ..Default::default()
         };
-        for rec in recommend(&index, q, &opts) {
+        for rec in recommend(&ctx.index, q, &opts) {
             let lines = rec
                 .lines
                 .into_iter()
@@ -1570,13 +1610,13 @@ pub fn run_recommend(cmd: &RecommendCmd) -> Result<CommandOutcome, CliError> {
         }
     }
 
-    let path_str = format_path_args(&cmd.paths);
     let mut commands = Vec::new();
     if let Some(first) = recs_out.first() {
         commands.push(SuggestedCommand {
             action: "inspect_exemplar".to_string(),
             command: format!(
-                "aroma search {path_str} --file {} --lines {}-{} --json",
+                "aroma search {} --file {} --lines {}-{} --json",
+                ctx.path_str,
                 shell_quote(&first.method.path),
                 first.method.start_line,
                 first.method.end_line
@@ -1584,54 +1624,31 @@ pub fn run_recommend(cmd: &RecommendCmd) -> Result<CommandOutcome, CliError> {
             destructive: false,
         });
     }
-    if rq.empty_hint.is_none() && recs_out.is_empty() {
-        rq.empty_hint = Some(format!(
-            "No recommendations reached --min-support {} and --min-sim {:.2}; try `aroma search {path_str} --lang {} --json` or lower --min-support",
-            cmd.min_support,
-            cmd.min_sim,
-            rq.meta.language
-        ));
-    }
+    let hint = ctx.resolved.empty_hint.take().or_else(|| {
+        recs_out.is_empty().then(|| {
+            format!(
+                "No recommendations reached --min-support {} and --min-sim {:.2}; try `aroma search {} --lang {} --json` or lower --min-support",
+                cmd.min_support, cmd.min_sim, ctx.path_str, ctx.resolved.meta.language
+            )
+        })
+    });
 
     let stdout = match cmd.mode {
-        OutputMode::Json => {
-            #[derive(Serialize)]
-            struct RecommendJsonOut<'a> {
-                ok: bool,
-                tool_version: &'static str,
-                contract_version: &'static str,
-                data_hash: &'a str,
-                corpus: &'a CorpusSummary,
-                query: &'a QueryMetaOut,
-                total: usize,
-                recommendations: &'a [RecOut],
-                commands: &'a [SuggestedCommand],
-                warnings: &'a [WarningItem],
-                hint: Option<String>,
-            }
-            let out = RecommendJsonOut {
-                ok: true,
-                tool_version: env!("CARGO_PKG_VERSION"),
-                contract_version: "1",
-                data_hash: &walk.data_hash,
-                corpus: &corpus,
-                query: &rq.meta,
-                total: recs_out.len(),
-                recommendations: &recs_out,
-                commands: &commands,
-                warnings: &rq.warnings,
-                hint: rq.empty_hint,
-            };
-            serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
-        }
+        OutputMode::Json => render_query_json(
+            &ctx,
+            recs_out.len(),
+            RecsPayload { recommendations: &recs_out },
+            &commands,
+            hint,
+        ),
         OutputMode::Human => {
             let mut txt = format!(
                 "aroma recommend: {} cluster(s) (lang={}, query_size={})\n",
                 recs_out.len(),
-                rq.meta.language,
-                rq.meta.size
+                ctx.resolved.meta.language,
+                ctx.resolved.meta.size
             );
-            if let Some(ref h) = rq.empty_hint {
+            if let Some(ref h) = hint {
                 txt.push_str(&format!("hint: {h}\n"));
             }
             for (i, r) in recs_out.iter().enumerate() {
@@ -1653,7 +1670,7 @@ pub fn run_recommend(cmd: &RecommendCmd) -> Result<CommandOutcome, CliError> {
     Ok(CommandOutcome {
         exit: ExitKind::Success,
         stdout,
-        stderr_notes: rq.notes,
+        stderr_notes: ctx.resolved.notes,
     })
 }
 

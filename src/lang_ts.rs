@@ -3,13 +3,12 @@
 //! Shares `TL_FRONT` scratch with Python front-end, uses packed single-byte
 //! `kind` + `named_kind` tables, and zero-alloc `NameSet`.
 
-use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use crate::lang_py::{FastMethod, FrontScratch, TL_FRONT};
+use crate::lang_py::{collect_parsed_methods, simplify_lezer_snippet, FastMethod, FrontScratch, TL_FRONT};
 use crate::lezer::{self, Grammar, SyntaxTree, NONE};
 use crate::simple::{Body, Cfg, Simplifier};
-use crate::text::{js_ws, NameSet, Src};
+use crate::text::{NameSet, Src};
 use crate::{Language, Node, ParsedMethod, SnippetOptions};
 
 pub(crate) fn shrink_tl_tree() {
@@ -126,32 +125,6 @@ fn grammar_for(path: Option<&str>) -> &'static Grammar {
     }
 }
 
-fn line_span(src: &Src<'_>, from: u32, to: u32) -> (u32, u32) {
-    let mut end = to;
-    while end > from + 1 && js_ws(src.unit(end - 1)) {
-        end -= 1;
-    }
-    (src.line_of(from), src.line_of(end.saturating_sub(1)))
-}
-
-#[inline]
-fn looks_global(src: &Src<'_>, from: u32, to: u32, globals: Option<&HashSet<String>>) -> bool {
-    if from < to {
-        let first = src.unit(from);
-        if (b'A' as u32..=b'Z' as u32).contains(&first) {
-            return true;
-        }
-    }
-    if let Some(g) = globals {
-        match src.str_range(from, to) {
-            Some(s) => g.contains(s),
-            None => g.contains(&src.string(from, to)),
-        }
-    } else {
-        false
-    }
-}
-
 #[inline(always)]
 fn is_function(t: &TsTables, tree: &SyntaxTree, n: u32) -> (bool, bool) {
     let k = kind_of(t, tree, n);
@@ -250,14 +223,6 @@ fn names_under(
     }
 }
 
-#[inline]
-fn push_src_span(src: &Src<'_>, span: (u32, u32), out: &mut String) {
-    match src.str_range(span.0, span.1) {
-        Some(s) => out.push_str(s),
-        None => out.push_str(&src.string(span.0, span.1)),
-    }
-}
-
 fn name_of(
     t: &TsTables,
     src: &Src<'_>,
@@ -312,7 +277,7 @@ fn name_of(
         if i > 0 {
             out.push('.');
         }
-        push_src_span(src, p, &mut out);
+        src.push_span(p, &mut out);
     }
     out
 }
@@ -351,7 +316,7 @@ pub(crate) fn parse_methods_into(
                     return;
                 }
                 let (start_line, end_line) = if let Some((min_ln, max_ln)) = line_range {
-                    let (sl, el) = line_span(src, tree.from(n), tree.to(n));
+                    let (sl, el) = src.line_span(tree.from(n), tree.to(n));
                     if el < min_ln || sl > max_ln {
                         return;
                     }
@@ -378,7 +343,7 @@ pub(crate) fn parse_methods_into(
                     let (sl, el) = if line_range.is_some() {
                         (start_line, end_line)
                     } else {
-                        line_span(src, tree.from(n), tree.to(n))
+                        src.line_span(tree.from(n), tree.to(n))
                     };
                     out.push(FastMethod { name, start_line: sl, end_line: el, body_root: root });
                 }
@@ -401,35 +366,27 @@ pub(crate) fn parse_snippet_into(
     body: &mut Body,
 ) -> Option<u32> {
     let t = tables();
-    TL_FRONT.with(|cell| {
-        let mut sc = cell.borrow_mut();
-        let FrontScratch { tree, src_buf, set_a, set_b, .. } = &mut *sc;
-        let src = Src::build(source, src_buf);
-        src.parse_into(grammar_for(options.path.as_deref()), tree);
-        names_under(t, &src, tree, 0, set_a, set_b);
-        let declared = &*set_a;
-        let imported = &*set_b;
-        let globals = options.globals.as_ref();
-        let simp = Simplifier {
-            src: &src,
-            tree,
-            cfg: &t.cfg,
-            is_local: |node| {
-                let k = kind_of(t, tree, node);
-                if k != K_VAR_NAME && k != K_VAR_DEF {
-                    return false;
-                }
-                let (a, b) = (tree.from(node), tree.to(node));
-                if declared.contains(&src, a, b) {
-                    return true;
-                }
-                !(imported.contains(&src, a, b)
-                    || looks_global(&src, a, b, globals)
-                    || is_callee(t, tree, node))
-            },
-        };
-        simp.run(body, 0)
-    })
+    let globals = options.globals.as_ref();
+    simplify_lezer_snippet(
+        source,
+        grammar_for(options.path.as_deref()),
+        &t.cfg,
+        body,
+        |src, tree, declared, imported| names_under(t, src, tree, 0, declared, imported),
+        |src, tree, declared, imported, node| {
+            let k = kind_of(t, tree, node);
+            if k != K_VAR_NAME && k != K_VAR_DEF {
+                return false;
+            }
+            let (a, b) = (tree.from(node), tree.to(node));
+            if declared.contains(src, a, b) {
+                return true;
+            }
+            !(imported.contains(src, a, b)
+                || src.looks_global(a, b, globals)
+                || is_callee(t, tree, node))
+        },
+    )
 }
 
 pub struct TypeScriptLanguage;
@@ -448,18 +405,9 @@ impl Language for TypeScriptLanguage {
     }
 
     fn parse_methods(&self, source: &str, path: &str) -> Vec<ParsedMethod> {
-        let mut body = Body::default();
-        let mut raw = Vec::new();
-        parse_methods_into(source, path, None, &mut body, &mut raw);
-        let base = source.as_bytes();
-        raw.into_iter()
-            .map(|m| ParsedMethod {
-                name: m.name,
-                start_line: m.start_line,
-                end_line: m.end_line,
-                body: body.to_node(base, m.body_root),
-            })
-            .collect()
+        collect_parsed_methods(source, |body, raw| {
+            parse_methods_into(source, path, None, body, raw);
+        })
     }
 
     fn parse_snippet(&self, source: &str, options: &SnippetOptions) -> Option<Node> {

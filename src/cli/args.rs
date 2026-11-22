@@ -392,14 +392,17 @@ pub fn parse_line_spec(spec: &str) -> Result<Vec<u32>, CliError> {
     Ok(lines)
 }
 
-fn parse_usize_bounded(
+fn parse_int_bounded<T>(
     flag: &str,
     val: &str,
-    min: usize,
-    max: usize,
+    min: T,
+    max: T,
     subcmd: &str,
-) -> Result<usize, CliError> {
-    let n: usize = val.parse().map_err(|_| {
+) -> Result<T, CliError>
+where
+    T: std::str::FromStr + Ord + Copy + std::fmt::Display,
+{
+    let n: T = val.parse().map_err(|_| {
         CliError::user_input(
             format!("invalid integer '{val}' for {flag}"),
             format!("{flag} expects a whole number between {min} and {max}"),
@@ -411,33 +414,7 @@ fn parse_usize_bounded(
         return Err(CliError::user_input(
             format!("{flag} value {n} is outside allowed range [{min}..={max}]"),
             "Numeric parameters are bounded to keep memory and runtime predictable",
-            format!("aroma {subcmd} . {flag} {} --json", min.max(n.min(max))),
-            "aroma capabilities --json",
-        ));
-    }
-    Ok(n)
-}
-
-fn parse_u32_bounded(
-    flag: &str,
-    val: &str,
-    min: u32,
-    max: u32,
-    subcmd: &str,
-) -> Result<u32, CliError> {
-    let n: u32 = val.parse().map_err(|_| {
-        CliError::user_input(
-            format!("invalid integer '{val}' for {flag}"),
-            format!("{flag} expects a whole number between {min} and {max}"),
-            format!("aroma {subcmd} --help"),
-            "aroma capabilities --json",
-        )
-    })?;
-    if n < min || n > max {
-        return Err(CliError::user_input(
-            format!("{flag} value {n} is outside allowed range [{min}..={max}]"),
-            "Numeric parameters are bounded to prevent degenerate configurations",
-            format!("aroma {subcmd} . {flag} {} --json", min.max(n.min(max))),
+            format!("aroma {subcmd} . {flag} {} --json", n.clamp(min, max)),
             "aroma capabilities --json",
         ));
     }
@@ -544,7 +521,7 @@ fn check_env(env: &[(String, String)], notes: &mut Vec<String>) -> Result<(Outpu
             }
             "AROMA_THREADS" => {
                 if !v.trim().is_empty() {
-                    let t = parse_usize_bounded("AROMA_THREADS", v.trim(), 1, MAX_THREADS, "triage")?;
+                    let t = parse_int_bounded("AROMA_THREADS", v.trim(), 1usize, MAX_THREADS, "triage")?;
                     default_threads = Some(t);
                 }
             }
@@ -638,7 +615,7 @@ fn parse_common_flag(
         }
         "--threads" | "-t" => {
             let v = ts.take_val(inline, "--threads", subcmd)?;
-            let n = parse_usize_bounded("--threads", &v, 1, MAX_THREADS, subcmd)?;
+            let n = parse_int_bounded("--threads", &v, 1usize, MAX_THREADS, subcmd)?;
             opts.threads = Some(n);
             Ok(None)
         }
@@ -650,7 +627,7 @@ fn parse_common_flag(
                 notes.push(format!("note: '{flag}' interpreted as '--top' (alias)"));
             }
             let v = ts.take_val(inline, "--top", subcmd)?;
-            opts.top = Some(parse_usize_bounded("--top", &v, 0, MAX_TOP, subcmd)?);
+            opts.top = Some(parse_int_bounded("--top", &v, 0usize, MAX_TOP, subcmd)?);
             Ok(None)
         }
         "--min-sim" => {
@@ -666,7 +643,7 @@ fn parse_common_flag(
                 return Err(unknown_flag_error(flag, allowed, subcmd));
             }
             let v = ts.take_val(inline, "--min-lines", subcmd)?;
-            opts.min_lines = Some(parse_u32_bounded("--min-lines", &v, 1, 10_000, subcmd)?);
+            opts.min_lines = Some(parse_int_bounded("--min-lines", &v, 1u32, 10_000u32, subcmd)?);
             Ok(None)
         }
         "--min-tokens" => {
@@ -674,7 +651,7 @@ fn parse_common_flag(
                 return Err(unknown_flag_error(flag, allowed, subcmd));
             }
             let v = ts.take_val(inline, "--min-tokens", subcmd)?;
-            opts.min_tokens = Some(parse_usize_bounded("--min-tokens", &v, 1, 100_000, subcmd)?);
+            opts.min_tokens = Some(parse_int_bounded("--min-tokens", &v, 1usize, 100_000, subcmd)?);
             Ok(None)
         }
         "--search-limit" => {
@@ -682,7 +659,7 @@ fn parse_common_flag(
                 return Err(unknown_flag_error(flag, allowed, subcmd));
             }
             let v = ts.take_val(inline, "--search-limit", subcmd)?;
-            opts.search_limit = Some(parse_usize_bounded("--search-limit", &v, 1, MAX_SEARCH_LIMIT, subcmd)?);
+            opts.search_limit = Some(parse_int_bounded("--search-limit", &v, 1usize, MAX_SEARCH_LIMIT, subcmd)?);
             Ok(None)
         }
         "--cluster-limit" => {
@@ -690,7 +667,7 @@ fn parse_common_flag(
                 return Err(unknown_flag_error(flag, allowed, subcmd));
             }
             let v = ts.take_val(inline, "--cluster-limit", subcmd)?;
-            opts.cluster_limit = Some(parse_usize_bounded("--cluster-limit", &v, 1, MAX_CLUSTER_LIMIT, subcmd)?);
+            opts.cluster_limit = Some(parse_int_bounded("--cluster-limit", &v, 1usize, MAX_CLUSTER_LIMIT, subcmd)?);
             Ok(None)
         }
         "--min-support" => {
@@ -698,7 +675,7 @@ fn parse_common_flag(
                 return Err(unknown_flag_error(flag, allowed, subcmd));
             }
             let v = ts.take_val(inline, "--min-support", subcmd)?;
-            opts.min_support = Some(parse_usize_bounded("--min-support", &v, 1, MAX_CLUSTER_LIMIT, subcmd)?);
+            opts.min_support = Some(parse_int_bounded("--min-support", &v, 1usize, MAX_CLUSTER_LIMIT, subcmd)?);
             Ok(None)
         }
         "--lang" | "--language" | "-l" => {
@@ -746,10 +723,10 @@ fn parse_common_flag(
                 return Err(unknown_flag_error(flag, allowed, subcmd));
             }
             let v = ts.take_val(inline, "--max-file-bytes", subcmd)?;
-            opts.max_file_bytes = Some(parse_usize_bounded(
+            opts.max_file_bytes = Some(parse_int_bounded(
                 "--max-file-bytes",
                 &v,
-                1,
+                1usize,
                 MAX_FILE_BYTES_CAP,
                 subcmd,
             )?);
