@@ -10,7 +10,11 @@ Originally built with full behavioral and numerical parity with [L9Labs/aroma-ty
 | --- | --- | --- | --- | --- |
 | **Rust** | `"rust"` | `.rs` | Native zero-dependency byte-slice lexer + Pass-1 local binder + error-recovering recursive-descent/Pratt parser (`src/lang_rs.rs`) | **New in `aroma-rs`** (not in `aroma-typescript`) |
 | **Python** | `"python"` | `.py` | Lezer LR/GLR runtime (`src/lang_py.rs`) | Full behavioral & numerical parity with `aroma-typescript` |
-| **TypeScript / JavaScript** | `"typescript"` | `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs` | Lezer LR/GLR runtime (`src/lang_ts.rs`) | Full behavioral & numerical parity with `aroma-typescript` |
+| **TypeScript / JavaScript** | `"typescript"` | `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs` | Lezer LR/GLR runtime (`src/lang_ts.rs`) | Parity with `aroma-typescript` for functions under 80 lines; larger ones are split (below) |
+
+### Splitting large TypeScript functions
+
+The paper never defines the method unit for nested code. Indexing each outermost function whole makes a service factory or a large component one method of thousands of lines, so search hits and clusters cover whole services. A TypeScript function of at least `DEFAULT_SPLIT_LINES` (80) lines that defines named functions — a factory's `const load = () => {}`, the methods of the object it returns, a component's handlers — is split: each named function is a method of its own, recursively, and is left out of the method around it, so the same code is never in two methods. Anonymous callbacks stay where they are. Names the outer function declares, such as a factory's parameters, are not local to the inner methods. `typescript_language_with(u32::MAX)` restores whole outermost functions.
 
 ## Installation
 

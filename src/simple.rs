@@ -235,14 +235,22 @@ impl Cfg {
 }
 
 /// `simplify` of lezer.ts: the simplified tree of a syntax node, added to `body`.
-pub(crate) struct Simplifier<'a, 'b, F: Fn(u32) -> bool> {
+/// `skip` leaves out whole subtrees, such as the inner functions a large
+/// TypeScript function is split into.
+pub(crate) struct Simplifier<'a, 'b, F: Fn(u32) -> bool, S: Fn(u32) -> bool = fn(u32) -> bool> {
     pub src: &'a Src<'b>,
     pub tree: &'a SyntaxTree,
     pub cfg: &'a Cfg,
     pub is_local: F,
+    pub skip: S,
 }
 
-impl<F: Fn(u32) -> bool> Simplifier<'_, '_, F> {
+/// The `skip` of a `Simplifier` that keeps every subtree.
+pub(crate) fn keep_all(_: u32) -> bool {
+    false
+}
+
+impl<F: Fn(u32) -> bool, S: Fn(u32) -> bool> Simplifier<'_, '_, F, S> {
     pub fn run(&self, body: &mut Body, root: u32) -> Option<u32> {
         let mark = body.scratch.len();
         let mut line_cur = 0usize;
@@ -279,7 +287,7 @@ impl<F: Fn(u32) -> bool> Simplifier<'_, '_, F> {
         let tree = self.tree;
         let ty = tree.ty(n) as usize;
         let fl = unsafe { *self.cfg.flags.get_unchecked(ty) };
-        if (fl & F_COMMENT) != 0 {
+        if (fl & F_COMMENT) != 0 || (self.skip)(n) {
             return None;
         }
         if (fl & F_EXPRSTMT) != 0 {

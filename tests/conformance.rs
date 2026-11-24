@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use aroma::{
     build_index, featurize, label, parent_feature, position_context, prune, python_language,
     queries_from_lines, query_from_snippet, recommend, search, sibling_feature, token_context,
-    token_feature, typescript_language, usage_feature, IndexOptions, Language, LineRole, MethodRef,
-    Node, ParsedMethod, RecommendOptions, SearchOptions, SnippetOptions, SourceFile, Token,
-    TokenTable, VAR,
+    token_feature, typescript_language, typescript_language_with, usage_feature, IndexOptions,
+    Language, LineRole, MethodRef, Node, ParsedMethod, RecommendOptions, SearchOptions,
+    SnippetOptions, SourceFile, Token, TokenTable, VAR,
 };
 
 // ============================================================================
@@ -1076,6 +1076,91 @@ fn test_typescript_front_end() {
     for expected in ["useState", "Alert", "onClose", "true", "false", "null"] {
         assert!(b_nonlocal.iter().any(|n| n == expected), "missing {expected} in {b_nonlocal:?}");
     }
+}
+
+/// A service factory: its methods are what callers use, so each is a method of its own.
+fn account_service() -> SourceFile {
+    file(
+        "account.ts",
+        &[
+            "export const AccountService = ({ db }: Deps) => {",
+            "  const load = async (sid: string) => {",
+            "    const account = await db.account.findUniqueOrThrow({ where: { sid } });",
+            "    return account;",
+            "  };",
+            "  audit(db);",
+            "  return {",
+            "    load,",
+            "    rename: async function (sid: string, name: string) {",
+            "      const account = await load(sid);",
+            "      return db.account.update({ where: { id: account.id }, data: { name } });",
+            "    },",
+            "    count() {",
+            "      return [1, 2].map((n) => n * 2).length;",
+            "    },",
+            "  };",
+            "};",
+        ],
+    )
+}
+
+#[test]
+fn test_typescript_splits_large_functions_into_named_functions() {
+    let src = account_service();
+    let methods = typescript_language_with(10).parse_methods(&src.source, &src.path);
+    let sigs: Vec<(&str, u32, u32)> = methods
+        .iter()
+        .map(|m| (m.name.as_str(), m.start_line, m.end_line))
+        .collect();
+    assert_eq!(
+        sigs,
+        vec![
+            ("AccountService", 1, 17),
+            ("AccountService.load", 2, 5),
+            ("AccountService.rename", 9, 12),
+            ("AccountService.count", 13, 15),
+        ]
+    );
+    // The inner bodies are gone from the outer method; the anonymous `map` callback stays in `count`.
+    let mut outer = Vec::new();
+    collect_tokens(&methods[0].body, &mut outer);
+    assert!(!outer.iter().any(|t| t.text == "findUniqueOrThrow"));
+    let mut count = Vec::new();
+    collect_tokens(&methods[3].body, &mut count);
+    assert!(count.iter().any(|t| t.text == "map"));
+    // `db` is the factory's parameter, so it keeps its name in the inner method.
+    // (`sid` in `{ where: { sid } }` is shorthand, which Lezer parses as a property name.)
+    assert!(names(&methods[1].body, false).iter().any(|n| n == "db"));
+    assert_eq!(names(&methods[1].body, true), vec!["account"]);
+
+    // Below the split size, and with the default of 80 lines, the factory stays whole.
+    let whole = typescript_language().parse_methods(&src.source, &src.path);
+    assert_eq!(whole.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["AccountService"]);
+}
+
+#[test]
+fn test_typescript_split_search_finds_inner_method() {
+    let src = account_service();
+    let index = build_index(
+        &[src],
+        IndexOptions {
+            languages: Some(vec![typescript_language_with(10)]),
+            ..Default::default()
+        },
+    );
+    let query = query_from_snippet(
+        &index,
+        "const account = await db.account.findUniqueOrThrow({ where: { sid } });",
+        &SnippetOptions {
+            language: Some("typescript".into()),
+            globals: Some(["db".to_string()].into_iter().collect()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let hits = search(&index, &query, &SearchOptions::default());
+    assert_eq!(hits[0].method.name, "AccountService.load");
+    assert!((hits[0].similarity - 1.0).abs() < 1e-12);
 }
 
 const PY_FETCH: &[&str] = &[

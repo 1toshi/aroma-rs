@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use crate::lezer::{self, Grammar, SyntaxTree, NONE};
-use crate::simple::{Body, Cfg, Simplifier};
+use crate::simple::{keep_all, Body, Cfg, Simplifier};
 use crate::text::{dedent_source, NameSet, Src, SrcBuf};
 use crate::{Language, Node, ParsedMethod, SnippetOptions};
 
@@ -422,6 +422,7 @@ pub(crate) fn parse_methods_into(
                                 && !outer.contains(src, tree.from(node), tree.to(node))
                                 && !is_keyword_arg(t, tree, node)
                         },
+                        skip: keep_all,
                     };
                     if let Some(root) = simp.run(body, b) {
                         let fn_span = span_after(t, tree, n, K_KW_DEF);
@@ -493,6 +494,7 @@ pub(crate) fn simplify_lezer_snippet(
             tree,
             cfg,
             is_local: |node| is_local(&src, tree, a, b, node),
+            skip: keep_all,
         };
         simp.run(body, 0)
     })

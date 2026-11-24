@@ -511,7 +511,7 @@ fn parse_file_into_body(
     out.clear();
     match lang.builtin_kind() {
         1 => lang_py::parse_methods_into(&file.source, line_range, body, out),
-        2 => lang_ts::parse_methods_into(&file.source, &file.path, line_range, body, out),
+        2 => lang_ts::parse_methods_into(&file.source, &file.path, line_range, lang.split_lines(), body, out),
         3 => lang_rs::parse_methods_into(&file.source, line_range, body, out),
         _ => {
             for m in lang.parse_methods(&file.source, &file.path) {

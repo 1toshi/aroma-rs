@@ -136,6 +136,11 @@ pub trait Language: Send + Sync {
     fn builtin_kind(&self) -> u8 {
         0
     }
+    /// For the built-in TypeScript front end: the split size of large functions.
+    #[doc(hidden)]
+    fn split_lines(&self) -> u32 {
+        u32::MAX
+    }
 }
 
 /// Returns the built-in Python (`.py`) language front end.
@@ -144,9 +149,19 @@ pub fn python_language() -> Box<dyn Language> {
 }
 
 /// Returns the built-in TypeScript/JavaScript (`.ts`, `.tsx`, `.js`, `.jsx`, ...) front end.
+/// Functions of at least [`DEFAULT_SPLIT_LINES`] lines that define named functions are
+/// indexed as one method per named function; see [`typescript_language_with`].
 pub fn typescript_language() -> Box<dyn Language> {
-    Box::new(lang_ts::TypeScriptLanguage)
+    Box::new(lang_ts::TypeScriptLanguage::default())
 }
+
+/// The TypeScript front end with a split size of its own; `u32::MAX` keeps every
+/// outermost function whole, as the paper's reference implementation does for Java.
+pub fn typescript_language_with(split_lines: u32) -> Box<dyn Language> {
+    Box::new(lang_ts::TypeScriptLanguage { split_lines })
+}
+
+pub use lang_ts::DEFAULT_SPLIT_LINES;
 
 /// Returns the built-in native Rust (`.rs`) language front end.
 pub fn rust_language() -> Box<dyn Language> {
