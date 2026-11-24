@@ -10,11 +10,26 @@ Originally built with full behavioral and numerical parity with [L9Labs/aroma-ty
 | --- | --- | --- | --- | --- |
 | **Rust** | `"rust"` | `.rs` | Native zero-dependency byte-slice lexer + Pass-1 local binder + error-recovering recursive-descent/Pratt parser (`src/lang_rs.rs`) | **New in `aroma-rs`** (not in `aroma-typescript`) |
 | **Python** | `"python"` | `.py` | Lezer LR/GLR runtime (`src/lang_py.rs`) | Full behavioral & numerical parity with `aroma-typescript` |
-| **TypeScript / JavaScript** | `"typescript"` | `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs` | Lezer LR/GLR runtime (`src/lang_ts.rs`) | Parity with `aroma-typescript` for functions under 80 lines; larger ones are split (below) |
+| **TypeScript / JavaScript** | `"typescript"` | `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs` | [oxc](https://oxc.rs) parser + semantic analysis (`src/lang_ts.rs`) | Not tree-identical to `aroma-typescript` (different parser); same Section 5 recall on our corpus (below) |
+
+### TypeScript front end (oxc)
+
+TypeScript and JavaScript are parsed with `oxc_parser`, and local variables come from `oxc_semantic`'s scope analysis instead of matching declared names: a name is local when it resolves to a value binding, other than an import, declared inside the method. Two variables with one name in different scopes are no longer one variable, and a shorthand `{ sid }` is the variable `sid`. A simplified parse tree has one subtree per AST node, holding its children in source order and the keyword and punctuation tokens of the text between them.
+
+A query snippet is parsed as-is, then with the brackets it leaves open closed. One that still does not parse, such as lines cut from the middle of a multi-line signature, falls back to a flat list of its tokens with names guessed local as in a parsed snippet.
+
+Measured on a 3,425-file TypeScript monorepo, against the Lezer front end it replaces, on the paper's Section 5 benchmark (500 sampled methods of at least 12 lines, 5-line queries):
+
+| | Lezer | oxc |
+| --- | ---: | ---: |
+| Lines cut from their method (`queries_from_lines`), contiguous / scattered, Recall@1 | 99.5% / 97.1% | 99.0% / 97.7% |
+| First 5 body lines parsed alone (`query_from_snippet`), Recall@1 | 65.6% | 67.1% |
+| Same, snippets that parse | 69.5% (472) | 91.3% (334) |
+| `build_index`, 1 / 16 threads | 2.41 / 0.46 s | 2.09 / 0.41 s |
 
 ### Splitting large TypeScript functions
 
-The paper never defines the method unit for nested code. Indexing each outermost function whole makes a service factory or a large component one method of thousands of lines, so search hits and clusters cover whole services. A TypeScript function of at least `DEFAULT_SPLIT_LINES` (80) lines that defines named functions — a factory's `const load = () => {}`, the methods of the object it returns, a component's handlers — is split: each named function is a method of its own, recursively, and is left out of the method around it, so the same code is never in two methods. Anonymous callbacks stay where they are. Names the outer function declares, such as a factory's parameters, are not local to the inner methods. `typescript_language_with(u32::MAX)` restores whole outermost functions.
+The paper never defines the method unit for nested code. Indexing each outermost function whole makes a service factory or a large component one method of thousands of lines, so search hits and clusters cover whole services. A TypeScript function of at least `DEFAULT_SPLIT_LINES` (80) lines that defines named functions — a factory's `const load = () => {}`, the methods of the object it returns, a component's handlers — is split: each named function is a method of its own, recursively, and is left out of the method around it, so the same code is never in two methods. Anonymous callbacks stay where they are. Bindings of the outer function, such as a factory's parameters, are not local to the inner methods. `typescript_language_with(u32::MAX)` restores whole outermost functions.
 
 ## Installation
 
@@ -87,7 +102,7 @@ aroma bench --manifest /path/to/corpus_manifest.json --queries /path/to/queries.
 
 ## Architecture
 
-- **Lezer runtime & front ends (`src/lezer/`, `src/lang_py.rs`, `src/lang_ts.rs`, `src/lang_rs.rs`, `src/simple.rs`, `src/text.rs`)**: Row-deduplicated LR action tables with 16-byte aligned `FastState` descriptors, `SINK_BIT` DFA early exit, inline `Stack.buffer` + `StackArena::collapse_to_root` GLR pruning, SIMD `memchr` literal/comment scanners, zero-copy ASCII `Src` wrapper, unified `FrontScratch` + zero-alloc `NameSet`, a zero-dependency byte-slice Rust lexer + recursive-descent/Pratt parser with local scope binding and `#.#` method-call extraction, and AST simplification into a flat `Body` arena with a 128-bit algebraic dedup digest.
+- **Front ends (`src/lezer/`, `src/lang_py.rs`, `src/lang_ts.rs`, `src/lang_rs.rs`, `src/simple.rs`, `src/text.rs`)**: Python on a Lezer LR/GLR runtime port with row-deduplicated action tables, 16-byte aligned `FastState` descriptors, `SINK_BIT` DFA early exit, and `StackArena::collapse_to_root` GLR pruning; TypeScript/JavaScript on `oxc_parser` + `oxc_semantic` with a per-thread reusable arena allocator; a zero-dependency byte-slice Rust lexer + recursive-descent/Pratt parser with local scope binding and `#.#` method-call extraction; all simplified into a flat `Body` arena with a 128-bit algebraic dedup digest.
 - **Structural featurization (`src/features.rs`)**: Single-pass CSR emission of `T`, up-to-3 `P`, `S`, and consecutive-local `U` features using zero-`String` 64-bit algebraic `mix` hashes and 1-byte `token_end_delta` spans (`255` overflow map).
 - **Indexing & storage (`src/index.rs`)**: Wait-free LPT chunk parsing -> 32-shard `ShardedFeatureTable` (bits `32..37` shard index preserving full SwissTable H2 entropy) -> parallel `MaybeUninit` feature remap -> parallel bucketed `(count << 24) | local_mid` inverted index -> single contiguous `SourceStore` blob. Single-threaded mode (`--threads 1`) skips all Rayon pools and intermediate chunk staging.
 - **Phases I & II search (`src/search.rs`, `src/prune.rs`)**: Branchless 4x-unrolled Phase I scatter computing overlap and capped Phase II score bounds in one pass; `canonical_file_id` L1 origin filtering; `select_nth_unstable` top-k extraction; 4 KB L1 Bloom filter + direct `qidx[fid]` lookup; Algorithm 1 `prune` with zero-greedy & `max_gain == 1` fast paths, signature-equivalence-class greedy (`SIG_THRESHOLD = 512`) with inline 64-bit tags, `[u64; 8]` 512-line stack bitset line extraction, and reusable `kept_buf` scratch.
@@ -132,7 +147,7 @@ let line_queries = queries_from_lines(&index, &files[0], &[1]);
 
 ## Build, Test & Benchmark
 
-Requires Rust 2024 toolchain (`rust-version = "1.88"`).
+Requires Rust 2024 toolchain (`rust-version = "1.98"`, the minimum oxc 0.160 supports).
 
 ```bash
 # Run full test suite + doc tests (with and without CLI feature)

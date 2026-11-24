@@ -167,11 +167,6 @@ impl<'a, C: Ch> Stream<'a, C> {
         }
     }
     #[inline(always)]
-    pub fn reset_same_token(&mut self, pos: i32) {
-        let t = self.tok;
-        self.reset(pos, Some(t));
-    }
-    #[inline(always)]
     pub fn clip_pos(&self, pos: i32) -> i32 {
         if pos >= self.end { self.end } else { pos.max(0) }
     }
@@ -179,27 +174,6 @@ impl<'a, C: Ch> Stream<'a, C> {
     pub fn read(&self, from: i32, to: i32) -> &'a [C] {
         &self.input[from as usize..to as usize]
     }
-}
-
-#[inline]
-fn find_offset(data: &[u16], start: usize, term: i32) -> i32 {
-    let mut i = start;
-    loop {
-        let next = unsafe { *data.get_unchecked(i) };
-        if next == 65535 {
-            return -1;
-        }
-        if next as i32 == term {
-            return (i - start) as i32;
-        }
-        i += 1;
-    }
-}
-
-#[inline]
-fn overrides(token: i32, prev: i32, table: &[u16], offset: usize) -> bool {
-    let i_prev = find_offset(table, offset, prev);
-    i_prev < 0 || find_offset(table, offset, token) < i_prev
 }
 
 // ============================================================================
@@ -563,77 +537,3 @@ pub(crate) fn read_token_group<C: Ch>(
     (cur, cur_end, la)
 }
 
-/// Register-resident `readToken` for small `LocalTokenGroup` tables.
-pub(crate) fn read_token_local<C: Ch>(
-    g: &Grammar,
-    data: &[u16],
-    stream: &mut Stream<C>,
-    prec_offset: usize,
-) {
-    let mut state = 0usize;
-    let group_mask: u16 = 1;
-    let start = stream.pos as usize;
-    let end = stream.end as usize;
-    let input = stream.input;
-    let mut pos = start;
-    let mut cur = stream.tok.value;
-    let mut cur_end = stream.tok.end;
-
-    'scan: loop {
-        if (group_mask & data[state]) == 0 {
-            break;
-        }
-        let acc_end = data[state + 1] as usize;
-        let mut i = state + 3;
-        while i < acc_end {
-            if (data[i + 1] & group_mask) > 0 {
-                let term = data[i];
-                if g.allows(term)
-                    && (cur == -1 || cur == term as i32 || overrides(term as i32, cur, data, prec_offset))
-                {
-                    cur = term as i32;
-                    cur_end = pos as i32;
-                    break;
-                }
-            }
-            i += 2;
-        }
-        let next = if pos < end { unsafe { input.get_unchecked(pos).code() } } else { -1 };
-        let mut low = 0usize;
-        let mut high = data[state + 2] as usize;
-        if next < 0 && high > low && data[acc_end + high * 3 - 3] == 65535 {
-            state = data[acc_end + high * 3 - 1] as usize;
-            continue 'scan;
-        }
-        while low < high {
-            let mid = (low + high) >> 1;
-            let index = acc_end + mid + (mid << 1);
-            let from = data[index] as i32;
-            let to = match data[index + 1] {
-                0 => 0x10000,
-                t => t as i32,
-            };
-            if next < from {
-                high = mid;
-            } else if next >= to {
-                low = mid + 1;
-            } else {
-                state = data[index + 2] as usize;
-                pos += 1;
-                continue 'scan;
-            }
-        }
-        break;
-    }
-
-    stream.tok.value = cur;
-    stream.tok.end = cur_end;
-    if pos > start {
-        let max_la = if pos < end { pos as i32 + 1 } else { end as i32 };
-        if max_la > stream.tok.look_ahead {
-            stream.tok.look_ahead = max_la;
-        }
-        stream.pos = pos as i32;
-        stream.next = if pos < end { unsafe { input.get_unchecked(pos).code() } } else { -1 };
-    }
-}

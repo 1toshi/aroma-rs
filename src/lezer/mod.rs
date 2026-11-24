@@ -1,6 +1,6 @@
 //! Port of the `@lezer/lr` runtime (v1.4.12) with the parse tables of
-//! `@lezer/python` 1.1.19 and `@lezer/javascript` 1.5.6, plus their external
-//! tokenizers and context trackers. Positions are UTF-16 code unit offsets,
+//! `@lezer/python` 1.1.19, plus its external tokenizers and context tracker.
+//! TypeScript and JavaScript are parsed by oxc (`src/lang_ts.rs`). Positions are UTF-16 code unit offsets,
 //! as in JavaScript; the parser is generic over the code unit type so ASCII
 //! sources are parsed straight from their bytes.
 
@@ -10,8 +10,6 @@ use std::sync::OnceLock;
 
 use rustc_hash::FxHashMap;
 
-#[allow(clippy::all, clippy::unreadable_literal, dead_code)]
-pub mod tables_js;
 #[allow(clippy::all, clippy::unreadable_literal, dead_code)]
 pub mod tables_py;
 
@@ -29,24 +27,10 @@ use stream::DfaAccel;
 #[derive(Clone, Copy, Debug)]
 pub enum Tok {
     Group(u16),
-    Local(u8),
     External { contextual: bool, fallback: bool, extend: bool },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Kind {
-    Python,
-    Js,
-}
-
-pub struct LocalGroup {
-    pub(crate) data: &'static [u16],
-    pub(crate) prec: usize,
-    pub(crate) else_token: i32,
-}
-
 pub struct Grammar {
-    pub kind: Kind,
     pub(crate) states: &'static [u32],
     pub(crate) data: &'static [u16],
     pub(crate) goto: &'static [u16],
@@ -61,10 +45,8 @@ pub struct Grammar {
     #[allow(dead_code)]
     pub(crate) dyn_prec: &'static [i32],
     pub(crate) tokenizers: &'static [Tok],
-    pub(crate) locals: &'static [LocalGroup],
     pub(crate) specialized: &'static [u16],
     pub(crate) specialize: fn(usize, &[u8]) -> i32,
-    pub(crate) dialect_flags: &'static [bool],
     pub(crate) disabled: &'static [u8],
     dfa_cell: &'static OnceLock<DfaAccel>,
     action_cell: &'static OnceLock<ActionTable>,
@@ -72,13 +54,8 @@ pub struct Grammar {
 }
 
 static PY_DFA: OnceLock<DfaAccel> = OnceLock::new();
-static TS_DFA: OnceLock<DfaAccel> = OnceLock::new();
-static TSX_DFA: OnceLock<DfaAccel> = OnceLock::new();
-static JSX_DFA: OnceLock<DfaAccel> = OnceLock::new();
 static PY_ACTIONS: OnceLock<ActionTable> = OnceLock::new();
-static JS_ACTIONS: OnceLock<ActionTable> = OnceLock::new();
 static PY_GOTO: OnceLock<GotoTable> = OnceLock::new();
-static JS_GOTO: OnceLock<GotoTable> = OnceLock::new();
 
 /// Compact single-target-accelerated goto table.
 /// Over 80% of LR non-terminals have a single unconditional goto target across
@@ -299,21 +276,7 @@ impl ActionTable {
     }
 }
 
-static JS_LOCALS: [LocalGroup; 2] = [
-    LocalGroup {
-        data: &tables_js::JS_LOCAL0_DATA,
-        prec: tables_js::JS_LOCAL0_PREC,
-        else_token: tables_js::JS_LOCAL0_ELSE,
-    },
-    LocalGroup {
-        data: &tables_js::JS_LOCAL1_DATA,
-        prec: tables_js::JS_LOCAL1_PREC,
-        else_token: tables_js::JS_LOCAL1_ELSE,
-    },
-];
-
 pub static PYTHON: Grammar = Grammar {
-    kind: Kind::Python,
     states: &tables_py::PY_STATES,
     data: &tables_py::PY_DATA,
     goto: &tables_py::PY_GOTO,
@@ -327,47 +290,14 @@ pub static PYTHON: Grammar = Grammar {
     node_names: &tables_py::PY_NODE_NAMES,
     dyn_prec: &tables_py::PY_DYN_PREC,
     tokenizers: &tables_py::PY_TOKENIZERS,
-    locals: &[],
     specialized: &tables_py::PY_SPECIALIZED,
     specialize: tables_py::py_specialize,
-    dialect_flags: &tables_py::PY_DIALECT_DEFAULT_FLAGS,
     disabled: &tables_py::PY_DIALECT_DEFAULT_DISABLED,
     dfa_cell: &PY_DFA,
     action_cell: &PY_ACTIONS,
     goto_cell: &PY_GOTO,
 };
 
-macro_rules! js_grammar {
-    ($name:ident, $flags:ident, $disabled:ident, $dfa:ident) => {
-        pub static $name: Grammar = Grammar {
-            kind: Kind::Js,
-            states: &tables_js::JS_STATES,
-            data: &tables_js::JS_DATA,
-            goto: &tables_js::JS_GOTO,
-            token_data: &tables_js::JS_TOKEN_DATA,
-            token_prec: tables_js::JS_TOKEN_PREC,
-            min_repeat_term: tables_js::JS_MIN_REPEAT_TERM,
-            max_term: tables_js::JS_MAX_TERM,
-            max_node: tables_js::JS_MAX_NODE,
-            top_state: tables_js::JS_TOP_STATE,
-            top_term: tables_js::JS_TOP_TERM,
-            node_names: &tables_js::JS_NODE_NAMES,
-            dyn_prec: &tables_js::JS_DYN_PREC,
-            tokenizers: &tables_js::JS_TOKENIZERS,
-            locals: &JS_LOCALS,
-            specialized: &tables_js::JS_SPECIALIZED,
-            specialize: tables_js::js_specialize,
-            dialect_flags: &tables_js::$flags,
-            disabled: &tables_js::$disabled,
-            dfa_cell: &$dfa,
-            action_cell: &JS_ACTIONS,
-            goto_cell: &JS_GOTO,
-        };
-    };
-}
-js_grammar!(TS, JS_DIALECT_TS_FLAGS, JS_DIALECT_TS_DISABLED, TS_DFA);
-js_grammar!(TSX, JS_DIALECT_TSX_FLAGS, JS_DIALECT_TSX_DISABLED, TSX_DFA);
-js_grammar!(JSX, JS_DIALECT_JSX_FLAGS, JS_DIALECT_JSX_DISABLED, JSX_DFA);
 
 // Action / state encoding constants.
 pub(crate) const REDUCE_FLAG: u32 = 65536;

@@ -662,5 +662,4 @@ pub fn py_specialize(index: usize, text: &[u8]) -> i32 {
     _ => -1,
   }
 }
-pub static PY_DIALECT_DEFAULT_FLAGS: [bool; 0] = [];
 pub static PY_DIALECT_DEFAULT_DISABLED: [u8; 0] = [];

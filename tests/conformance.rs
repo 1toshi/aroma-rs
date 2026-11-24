@@ -1128,10 +1128,10 @@ fn test_typescript_splits_large_functions_into_named_functions() {
     let mut count = Vec::new();
     collect_tokens(&methods[3].body, &mut count);
     assert!(count.iter().any(|t| t.text == "map"));
-    // `db` is the factory's parameter, so it keeps its name in the inner method.
-    // (`sid` in `{ where: { sid } }` is shorthand, which Lezer parses as a property name.)
+    // `db` is the factory's parameter, so it keeps its name in the inner method; `sid`, the
+    // inner method's own parameter, is local, including as the shorthand `{ where: { sid } }`.
     assert!(names(&methods[1].body, false).iter().any(|n| n == "db"));
-    assert_eq!(names(&methods[1].body, true), vec!["account"]);
+    assert_eq!(names(&methods[1].body, true), vec!["account", "sid"]);
 
     // Below the split size, and with the default of 80 lines, the factory stays whole.
     let whole = typescript_language().parse_methods(&src.source, &src.path);

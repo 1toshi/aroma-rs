@@ -1,5 +1,4 @@
 //! High-speed parse driver (`Parse` and `TokenCache` in @lezer/lr) with:
-//! - Const-generic `IS_PY` specialization eliminating runtime grammar-kind branches.
 //! - Direct inline fast-reject / fast-emit for all JS & Python external tokenizers.
 //! - SIMD `memchr` acceleration for Python strings/docstrings and JS template strings/block comments.
 //! - Register-returning `read_token_group` + `FALLBACK_MASK` pruning + compact `MainTok`.
@@ -8,7 +7,7 @@
 use std::cell::RefCell;
 
 use super::stack::{Rec, Stack, StackArena};
-use super::stream::{read_token_group, read_token_local, CachedToken, Ch, DfaAccel, Stream};
+use super::stream::{read_token_group, CachedToken, Ch, DfaAccel, Stream};
 use super::tree::{build_tree_into, SyntaxTree};
 use super::*;
 
@@ -53,17 +52,6 @@ mod py {
             25 | 49 | 50 | 263 | 65 | 130 | 56 | 57 | 238 | 62 | 63 | 72 | 73 | 77 | 60 | 61 | 151 | 152 | 155 | 112
         )
     }
-}
-
-mod jst {
-    pub const NO_SEMI: i32 = 317;
-    pub const NO_SEMI_TYPE: i32 = 318;
-    pub const INCDEC: i32 = 1;
-    pub const INCDEC_PREFIX: i32 = 2;
-    pub const QUESTION_DOT: i32 = 3;
-    pub const JSX_START_TAG: i32 = 4;
-    pub const INSERT_SEMI: i32 = 319;
-    pub const DIALECT_JSX: usize = 0;
 }
 
 #[inline]
@@ -177,21 +165,13 @@ impl<C: Ch> Env<'_, '_, C> {
     // ----- external tokenizers -----
 
     #[inline]
-    fn external<const IS_PY: bool>(&mut self, index: usize, stack: &Stack) {
-        if IS_PY {
-            match index {
-                0 => self.py_legacy_print(),
-                1 => self.py_indentation(stack),
-                2 => self.py_newlines(stack),
-                3 => self.py_strings(stack),
-                _ => unreachable!(),
-            }
-        } else {
-            match index {
-                2 => self.js_operator_token(stack),
-                3 => self.js_jsx(),
-                _ => unreachable!(),
-            }
+    fn external(&mut self, index: usize, stack: &Stack) {
+        match index {
+            0 => self.py_legacy_print(),
+            1 => self.py_indentation(stack),
+            2 => self.py_newlines(stack),
+            3 => self.py_strings(stack),
+            _ => unreachable!(),
         }
     }
 
@@ -416,74 +396,6 @@ impl<C: Ch> Env<'_, '_, C> {
         }
     }
 
-    #[inline]
-    fn js_operator_token(&mut self, stack: &Stack) {
-        let next = self.stream.next;
-        if next == 43 || next == 45 {
-            self.stream.advance(1);
-            if next == self.stream.next {
-                self.stream.advance(1);
-                let may_postfix = stack.ctx == 0 && stack.can_shift(self.g, self.at, jst::INCDEC);
-                self.stream.accept_token(if may_postfix { jst::INCDEC } else { jst::INCDEC_PREFIX }, 0);
-            }
-        } else if next == 63 && self.stream.peek(1) == 46 {
-            self.stream.advance(1);
-            self.stream.advance(1);
-            let n = self.stream.next;
-            if !(48..=57).contains(&n) {
-                self.stream.accept_token(jst::QUESTION_DOT, 0);
-            }
-        }
-    }
-
-    #[inline]
-    fn js_jsx(&mut self) {
-        if self.stream.next != 60 || !self.g.dialect_flags[jst::DIALECT_JSX] {
-            return;
-        }
-        let s = &mut self.stream;
-        s.advance(1);
-        if s.next == 47 {
-            return;
-        }
-        let mut back = 0;
-        while is_js_space(s.next) {
-            s.advance(1);
-            back += 1;
-        }
-        if ident_char(s.next, true) {
-            s.advance(1);
-            back += 1;
-            while ident_char(s.next, false) {
-                s.advance(1);
-                back += 1;
-            }
-            while is_js_space(s.next) {
-                s.advance(1);
-                back += 1;
-            }
-            if s.next == 44 {
-                return;
-            }
-            let ext = b"extends";
-            let mut i = 0;
-            loop {
-                if i == 7 {
-                    if !ident_char(s.next, true) {
-                        return;
-                    }
-                    break;
-                }
-                if s.next != ext[i] as i32 {
-                    break;
-                }
-                s.advance(1);
-                back += 1;
-                i += 1;
-            }
-        }
-        s.accept_token(jst::JSX_START_TAG, -back);
-    }
 }
 
 #[inline]
@@ -525,26 +437,6 @@ fn skip_escape<C: Ch>(s: &mut Stream<C>, ch: i32) {
             s.advance(1);
         }
     }
-}
-
-#[inline(always)]
-fn is_js_space(c: i32) -> bool {
-    if c <= 32 {
-        c == 32 || (9..=13).contains(&c)
-    } else if c < 133 {
-        false
-    } else {
-        matches!(c, 133 | 160 | 5760 | 8192..=8202 | 8232 | 8233 | 8239 | 8287 | 12288)
-    }
-}
-
-#[inline(always)]
-fn ident_char(ch: i32, start: bool) -> bool {
-    (65..=90).contains(&ch)
-        || (97..=122).contains(&ch)
-        || ch == 95
-        || ch >= 192
-        || (!start && (48..=57).contains(&ch))
 }
 
 // ---------------------------------------------------------------------------
@@ -595,18 +487,17 @@ impl TokenCache {
     }
 
     #[inline]
-    fn get_actions<const IS_PY: bool, C: Ch>(&mut self, env: &mut Env<C>, stack: &mut Stack) -> usize {
+    fn get_actions<C: Ch>(&mut self, env: &mut Env<C>, stack: &mut Stack) -> usize {
         let g = env.g;
         let at = env.at;
         let state = stack.state;
         let fs = at.fast_state(state);
         let mask = fs.tok_mask;
         let row_off = fs.act_row_off;
-        let fallback_mask: u32 = if IS_PY { 0 } else { 1u32 << 17 };
 
         let mut action_index = 0usize;
         let mut main: Option<MainTok> = None;
-        let context = if IS_PY { stack.ctx_hash } else { 0 };
+        let context = stack.ctx_hash;
         let pos = stack.pos;
         let ch = env.stream.char_at(pos);
         let mut look_ahead = 0;
@@ -625,174 +516,85 @@ impl TokenCache {
                     if main.is_some() && !fallback {
                         continue;
                     }
-                    if !IS_PY {
-                        match i {
-                            0 => {
-                                // js_no_semicolon
-                                if stack.ctx == 0
-                                    && ch != -1
-                                    && ch != 125
-                                    && ch != 59
-                                    && !is_js_space(ch)
-                                {
-                                    let is_comment = ch == 47 && {
-                                        let a = env.stream.char_at(pos + 1);
-                                        a == 47 || a == 42
-                                    };
-                                    if !is_comment {
-                                        let si = action_index;
-                                        action_index = self.add_actions(
-                                            g,
-                                            at,
-                                            state,
-                                            row_off,
-                                            jst::NO_SEMI,
-                                            pos,
-                                            action_index,
-                                        );
-                                        main = Some(MainTok { start: pos, end: pos, value: jst::NO_SEMI });
-                                        if action_index > si {
-                                            break;
-                                        }
-                                        rem &= fallback_mask;
-                                    }
-                                }
+                    match i {
+                        0 => {
+                            if ch != b'p' as i32 {
                                 continue;
                             }
-                            1 => {
-                                // js_no_semicolon_type
-                                if ch == 91 && stack.ctx == 0 {
-                                    let si = action_index;
-                                    action_index = self.add_actions(
-                                        g,
-                                        at,
-                                        state,
-                                        row_off,
-                                        jst::NO_SEMI_TYPE,
-                                        pos,
-                                        action_index,
-                                    );
-                                    main = Some(MainTok { start: pos, end: pos, value: jst::NO_SEMI_TYPE });
-                                    if action_index > si {
-                                        break;
-                                    }
-                                    rem &= fallback_mask;
-                                }
-                                continue;
-                            }
-                            2 => {
-                                if ch != 43 && ch != 45 && ch != 63 {
-                                    continue;
-                                }
-                            }
-                            3 => {
-                                if ch != 60 || !g.dialect_flags[jst::DIALECT_JSX] {
-                                    continue;
-                                }
-                            }
-                            17 => {
-                                // js_insert_semicolon (fallback: true)
-                                if ch == 125 || ch == -1 || stack.ctx != 0 {
-                                    let si = action_index;
-                                    action_index = self.add_actions(
-                                        g,
-                                        at,
-                                        state,
-                                        row_off,
-                                        jst::INSERT_SEMI,
-                                        pos,
-                                        action_index,
-                                    );
-                                    main = Some(MainTok { start: pos, end: pos, value: jst::INSERT_SEMI });
-                                    if action_index > si {
-                                        break;
-                                    }
-                                }
-                                continue;
-                            }
-                            _ => {}
                         }
-                    } else {
-                        match i {
-                            0 => {
-                                if ch != b'p' as i32 {
-                                    continue;
-                                }
+                        1 => {
+                            if stack.ctx_flags != 0 {
+                                continue;
                             }
-                            1 => {
-                                if stack.ctx_flags != 0 {
-                                    continue;
-                                }
-                                let prev = env.stream.char_at(pos - 1);
-                                if prev != 10 && prev != 13 {
-                                    continue;
-                                }
+                            let prev = env.stream.char_at(pos - 1);
+                            if prev != 10 && prev != 13 {
+                                continue;
                             }
-                            2 => {
-                                if ch < 0 {
+                        }
+                        2 => {
+                            if ch < 0 {
+                                let si = action_index;
+                                action_index = self.add_actions(
+                                    g,
+                                    at,
+                                    state,
+                                    row_off,
+                                    py::EOF,
+                                    pos,
+                                    action_index,
+                                );
+                                main = Some(MainTok { start: pos, end: pos, value: py::EOF });
+                                if action_index > si {
+                                    break;
+                                }
+                                rem = 0;
+                                continue;
+                            }
+                            if (stack.ctx_flags & CX_BRACKETED) != 0 {
+                                if ch == 10 || ch == 13 {
+                                    let end = (pos + 1).min(env.stream.end);
                                     let si = action_index;
                                     action_index = self.add_actions(
                                         g,
                                         at,
                                         state,
                                         row_off,
-                                        py::EOF,
-                                        pos,
+                                        py::NEWLINE_BRACKETED,
+                                        end,
                                         action_index,
                                     );
-                                    main = Some(MainTok { start: pos, end: pos, value: py::EOF });
+                                    main = Some(MainTok { start: pos, end, value: py::NEWLINE_BRACKETED });
                                     if action_index > si {
                                         break;
                                     }
                                     rem = 0;
-                                    continue;
                                 }
-                                if (stack.ctx_flags & CX_BRACKETED) != 0 {
-                                    if ch == 10 || ch == 13 {
-                                        let end = (pos + 1).min(env.stream.end);
-                                        let si = action_index;
-                                        action_index = self.add_actions(
-                                            g,
-                                            at,
-                                            state,
-                                            row_off,
-                                            py::NEWLINE_BRACKETED,
-                                            end,
-                                            action_index,
-                                        );
-                                        main = Some(MainTok { start: pos, end, value: py::NEWLINE_BRACKETED });
-                                        if action_index > si {
-                                            break;
-                                        }
-                                        rem = 0;
-                                    }
-                                    continue;
-                                }
-                                let prev = env.stream.char_at(pos - 1);
-                                if prev != -1 && prev != 10 && prev != 13 {
-                                    if ch == 10 || ch == 13 {
-                                        let end = (pos + 1).min(env.stream.end);
-                                        let si = action_index;
-                                        action_index = self.add_actions(
-                                            g,
-                                            at,
-                                            state,
-                                            row_off,
-                                            py::NEWLINE,
-                                            end,
-                                            action_index,
-                                        );
-                                        main = Some(MainTok { start: pos, end, value: py::NEWLINE });
-                                        if action_index > si {
-                                            break;
-                                        }
-                                        rem = 0;
-                                    }
-                                    continue;
-                                }
+                                continue;
                             }
-                            _ => {}
+                            let prev = env.stream.char_at(pos - 1);
+                            if prev != -1 && prev != 10 && prev != 13 {
+                                if ch == 10 || ch == 13 {
+                                    let end = (pos + 1).min(env.stream.end);
+                                    let si = action_index;
+                                    action_index = self.add_actions(
+                                        g,
+                                        at,
+                                        state,
+                                        row_off,
+                                        py::NEWLINE,
+                                        end,
+                                        action_index,
+                                    );
+                                    main = Some(MainTok { start: pos, end, value: py::NEWLINE });
+                                    if action_index > si {
+                                        break;
+                                    }
+                                    rem = 0;
+                                }
+                                continue;
+                            }
                         }
+                        _ => {}
                     }
 
                     // Slow path for remaining external invocations
@@ -800,10 +602,10 @@ impl TokenCache {
                     if contextual || slot.start != pos || slot.mask != mask || slot.context != context {
                         let start = env.stream.clip_pos(pos);
                         env.stream.reset(start, Some(*slot));
-                        env.external::<IS_PY>(i, stack);
+                        env.external(i, stack);
                         let mut t = env.stream.tok;
                         if t.value > -1 {
-                            Self::apply_specialize::<IS_PY, C>(g, at, env.stream.input, &mut t);
+                            Self::apply_specialize::<C>(g, at, env.stream.input, &mut t);
                         } else {
                             t.value = TERM_ERR;
                             t.end = env.stream.clip_pos(start + 1);
@@ -843,7 +645,7 @@ impl TokenCache {
                             if action_index > start_index {
                                 break;
                             }
-                            rem &= fallback_mask;
+                            rem = 0;
                         }
                     }
                 }
@@ -866,7 +668,7 @@ impl TokenCache {
                             context: 0,
                         };
                         if t.value > -1 {
-                            Self::apply_specialize::<IS_PY, C>(g, at, env.stream.input, &mut t);
+                            Self::apply_specialize::<C>(g, at, env.stream.input, &mut t);
                         } else {
                             t.value = TERM_ERR;
                             t.end = env.stream.clip_pos(start + 1);
@@ -903,76 +705,7 @@ impl TokenCache {
                         if action_index > start_index {
                             break;
                         }
-                        rem &= fallback_mask;
-                    }
-                }
-                Tok::Local(k) => {
-                    if main.is_some() {
-                        continue;
-                    }
-                    let slot = unsafe { self.tokens.get_unchecked_mut(i) };
-                    if slot.start != pos {
-                        let start = env.stream.clip_pos(pos);
-                        let fast = if !IS_PY {
-                            fast_js_local(k, env.stream.input, start as usize)
-                        } else {
-                            None
-                        };
-                        let mut t = if let Some((val, end)) = fast {
-                            CachedToken {
-                                start,
-                                value: val,
-                                end,
-                                extended: -1,
-                                look_ahead: (start + 1).min(env.stream.end),
-                                mask: 0,
-                                context: 0,
-                            }
-                        } else {
-                            env.stream.reset(start, Some(*slot));
-                            let lg = &g.locals[k as usize];
-                            local_token(g, lg, &mut env.stream);
-                            env.stream.tok
-                        };
-                        if t.value > -1 {
-                            Self::apply_specialize::<IS_PY, C>(g, at, env.stream.input, &mut t);
-                        } else {
-                            t.value = TERM_ERR;
-                            t.end = env.stream.clip_pos(start + 1);
-                        }
-                        *slot = t;
-                    }
-                    let token = *slot;
-                    if token.look_ahead > token.end + LOOKAHEAD_MARGIN {
-                        look_ahead = look_ahead.max(token.look_ahead);
-                    }
-                    if token.value != TERM_ERR {
-                        let start_index = action_index;
-                        if token.extended > -1 {
-                            action_index = self.add_actions(
-                                g,
-                                at,
-                                state,
-                                row_off,
-                                token.extended,
-                                token.end,
-                                action_index,
-                            );
-                        }
-                        action_index = self.add_actions(
-                            g,
-                            at,
-                            state,
-                            row_off,
-                            token.value,
-                            token.end,
-                            action_index,
-                        );
-                        main = Some(MainTok { start: token.start, end: token.end, value: token.value });
-                        if action_index > start_index {
-                            break;
-                        }
-                        rem &= fallback_mask;
+                        rem = 0;
                     }
                 }
             }
@@ -990,7 +723,7 @@ impl TokenCache {
     }
 
     #[inline(always)]
-    fn apply_specialize<const IS_PY: bool, C: Ch>(
+    fn apply_specialize<C: Ch>(
         g: &Grammar,
         at: &ActionTable,
         input: &[C],
@@ -998,27 +731,7 @@ impl TokenCache {
     ) {
         let tv = t.value;
         let len = (t.end - t.start) as usize;
-        if IS_PY {
-            if tv != 221 || !(2..=8).contains(&len) {
-                return;
-            }
-        } else if tv == 328 {
-            if !(2..=10).contains(&len) {
-                return;
-            }
-        } else if tv == 344 {
-            if !(3..=9).contains(&len) {
-                return;
-            }
-        } else if tv == 95 {
-            if len == 1 && unsafe { input.get_unchecked(t.start as usize).code() } == b'<' as i32 {
-                // `JS_SPECIALIZED[2]` (`<`) -> 193 (extend = 1, term = 96)
-                if g.allows(96) {
-                    t.extended = 96;
-                }
-            }
-            return;
-        } else {
+        if tv != 221 || !(2..=8).contains(&len) {
             return;
         }
         let si = unsafe { *at.spec_idx.get_unchecked(tv as usize) };
@@ -1161,87 +874,6 @@ impl TokenCache {
     }
 }
 
-/// SIMD `memchr` fast path for JS `LocalTokenGroup` 0 (template strings) and 1 (block comments).
-#[inline]
-fn fast_js_local<C: Ch>(k: u8, input: &[C], start: usize) -> Option<(i32, i32)> {
-    let bytes = C::as_u8_slice(input)?;
-    let end = bytes.len();
-    if start >= end {
-        return None;
-    }
-    if k == 1 {
-        // Block comment: `\n` -> 325, `*/` -> 326, else -> 324
-        let b0 = unsafe { *bytes.get_unchecked(start) };
-        if b0 == b'\n' {
-            return Some((325, (start + 1) as i32));
-        }
-        if b0 == b'*' && start + 1 < end && unsafe { *bytes.get_unchecked(start + 1) } == b'/' {
-            return Some((326, (start + 2) as i32));
-        }
-        let mut p = start + 1;
-        while p < end {
-            match memchr::memchr2(b'\n', b'*', &bytes[p..end]) {
-                None => {
-                    p = end;
-                    break;
-                }
-                Some(rel) => {
-                    p += rel;
-                    let b = unsafe { *bytes.get_unchecked(p) };
-                    if b == b'\n' || (p + 1 < end && unsafe { *bytes.get_unchecked(p + 1) } == b'/') {
-                        break;
-                    }
-                    p += 1;
-                }
-            }
-        }
-        return Some((324, p as i32));
-    }
-    if k == 0 {
-        // Template string: `${` -> 40, `\` -> 52 (escapes), `` ` `` -> 342, else -> 341
-        let b0 = unsafe { *bytes.get_unchecked(start) };
-        if b0 == b'`' {
-            return Some((342, (start + 1) as i32));
-        }
-        if b0 == b'\\' || (b0 == b'$' && start + 1 < end && bytes[start + 1] == b'{') {
-            return None;
-        }
-        let mut p = start + 1;
-        while p < end {
-            match memchr::memchr3(b'$', b'\\', b'`', &bytes[p..end]) {
-                None => {
-                    p = end;
-                    break;
-                }
-                Some(rel) => {
-                    p += rel;
-                    let b = unsafe { *bytes.get_unchecked(p) };
-                    if b == b'`' {
-                        break;
-                    }
-                    if b == b'$' {
-                        if p + 1 < end && unsafe { *bytes.get_unchecked(p + 1) } == b'{' {
-                            break;
-                        }
-                        p += 1;
-                    } else {
-                        // b == b'\\': guaranteed match of token 52 unless followed by `u`, `x`, or EOF
-                        if p + 1 < end {
-                            let n = unsafe { *bytes.get_unchecked(p + 1) };
-                            if n != b'u' && n != b'x' {
-                                break;
-                            }
-                        }
-                        return None;
-                    }
-                }
-            }
-        }
-        return Some((341, p as i32));
-    }
-    None
-}
-
 #[inline(always)]
 fn specialize_text<C: Ch>(g: &Grammar, index: usize, text: &[C]) -> i32 {
     if let Some(bytes) = C::as_u8_slice(text) {
@@ -1259,33 +891,6 @@ fn specialize_text<C: Ch>(g: &Grammar, index: usize, text: &[C]) -> i32 {
         buf[k] = v as u8;
     }
     (g.specialize)(index, &buf[..text.len()])
-}
-
-fn local_token<C: Ch>(g: &Grammar, lg: &LocalGroup, s: &mut Stream<C>) {
-    let start = s.pos;
-    let mut skipped = 0;
-    loop {
-        let at_eof = s.next < 0;
-        let next_pos = if s.pos + 1 < s.end { Some(s.pos + 1) } else { None };
-        read_token_local(g, lg.data, s, lg.prec);
-        if s.tok.value > -1 {
-            break;
-        }
-        if lg.else_token < 0 {
-            return;
-        }
-        if !at_eof {
-            skipped += 1;
-        }
-        match next_pos {
-            None => break,
-            Some(p) => s.reset_same_token(p),
-        }
-    }
-    if skipped > 0 {
-        s.reset_same_token(start);
-        s.accept_token(lg.else_token, skipped);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1347,7 +952,7 @@ pub fn shrink_tl_workspace() {
 }
 
 // ---------------------------------------------------------------------------
-// Parse driver (const-generic over `IS_PY`, arena-indexed stacks)
+// Parse driver (arena-indexed stacks)
 // ---------------------------------------------------------------------------
 
 struct Parse<'a, 'w, C: Ch> {
@@ -1392,7 +997,7 @@ fn find_finished(at: &ActionTable, arena: &StackArena, end: i32, stacks: &[u32])
 }
 
 impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
-    fn run_fast<const IS_PY: bool>(&mut self) -> Option<u32> {
+    fn run_fast(&mut self) -> Option<u32> {
         let at = self.env.at;
         loop {
             if self.stacks.len() == 1 && self.recovering == 0 {
@@ -1401,7 +1006,7 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
                 loop {
                     let stack = self.arena.get_mut(sid);
                     if self.env.big_count > 300 {
-                        while stack.force_reduce::<IS_PY, C>(&mut self.env)
+                        while stack.force_reduce::<C>(&mut self.env)
                             && !stack.stack.is_empty()
                             && stack.stack.last().unwrap().start >= self.env.last_big_start
                         {}
@@ -1414,21 +1019,21 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
                         if dr == 0 {
                             break;
                         }
-                        stack.reduce::<IS_PY, C>(&mut self.env, dr);
+                        stack.reduce::<C>(&mut self.env, dr);
                     }
 
                     if stack.stack.len() >= 2800 {
-                        while stack.stack.len() > 2000 && stack.force_reduce::<IS_PY, C>(&mut self.env) {}
+                        while stack.stack.len() > 2000 && stack.force_reduce::<C>(&mut self.env) {}
                     }
 
                     self.tokens.main_token = None;
-                    let n = self.tokens.get_actions::<IS_PY, C>(&mut self.env, stack);
+                    let n = self.tokens.get_actions::<C>(&mut self.env, stack);
                     if n == 3 {
                         let action = unsafe { *self.tokens.actions.get_unchecked(0) } as u32;
                         let term = unsafe { *self.tokens.actions.get_unchecked(1) };
                         let end = unsafe { *self.tokens.actions.get_unchecked(2) };
                         let st = self.tokens.main_token.map_or(stack.pos, |m| m.start);
-                        stack.apply::<IS_PY, C>(&mut self.env, action, term, st, end);
+                        stack.apply::<C>(&mut self.env, action, term, st, end);
                         self.min_stack_pos = stack.pos;
                         continue;
                     }
@@ -1466,12 +1071,12 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
                         if i == n {
                             let s = self.arena.get_mut(sid);
                             let st = main_start.unwrap_or(s.pos);
-                            s.apply::<IS_PY, C>(&mut self.env, action, term, st, end);
+                            s.apply::<C>(&mut self.env, action, term, st, end);
                         } else {
                             let lid = self.arena.split(sid);
                             let local = self.arena.get_mut(lid);
                             let st = main_start.unwrap_or(local.pos);
-                            local.apply::<IS_PY, C>(&mut self.env, action, term, st, end);
+                            local.apply::<C>(&mut self.env, action, term, st, end);
                             if local.pos > start {
                                 self.new_stacks.push(lid);
                             } else {
@@ -1479,20 +1084,20 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
                             }
                         }
                     }
-                    if let Some(done) = self.finish_step::<IS_PY>(start) {
+                    if let Some(done) = self.finish_step(start) {
                         return Some(done);
                     }
                     break;
                 }
             }
 
-            if let Some(done) = self.advance_slow::<IS_PY>() {
+            if let Some(done) = self.advance_slow() {
                 return Some(done);
             }
         }
     }
 
-    fn advance_slow<const IS_PY: bool>(&mut self) -> Option<u32> {
+    fn advance_slow(&mut self) -> Option<u32> {
         if self.arena.since_gc > 64 {
             self.arena.gc(self.stacks);
         }
@@ -1505,7 +1110,7 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
         if self.env.big_count > 300 && self.work_stacks.len() == 1 {
             let sid = self.work_stacks[0];
             let s = self.arena.get_mut(sid);
-            while s.force_reduce::<IS_PY, C>(&mut self.env)
+            while s.force_reduce::<C>(&mut self.env)
                 && !s.stack.is_empty()
                 && s.stack.last().unwrap().start >= self.env.last_big_start
             {}
@@ -1513,10 +1118,10 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
             self.env.last_big_size = 0;
         }
 
-        self.finish_step::<IS_PY>(pos)
+        self.finish_step(pos)
     }
 
-    fn finish_step<const IS_PY: bool>(&mut self, pos: i32) -> Option<u32> {
+    fn finish_step(&mut self, pos: i32) -> Option<u32> {
         self.stopped.clear();
         self.stopped_tokens.clear();
 
@@ -1527,7 +1132,7 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
                 self.tokens.main_token = None;
                 if self.arena.get(sid).pos > pos {
                     self.new_stacks.push(sid);
-                } else if self.advance_stack::<IS_PY>(sid, true) {
+                } else if self.advance_stack(sid, true) {
                     continue;
                 } else {
                     let tok = self.tokens.get_main_token(&self.env, self.arena.get(sid));
@@ -1551,8 +1156,8 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
         if self.recovering != 0 && !self.stopped.is_empty() {
             let stopped_copy = self.stopped.clone();
             let tokens_copy = self.stopped_tokens.clone();
-            if let Some(finished) = self.run_recovery::<IS_PY>(&stopped_copy, &tokens_copy) {
-                self.arena.get_mut(finished).force_all::<IS_PY, C>(&mut self.env);
+            if let Some(finished) = self.run_recovery(&stopped_copy, &tokens_copy) {
+                self.arena.get_mut(finished).force_all::<C>(&mut self.env);
                 return Some(finished);
             }
         }
@@ -1613,19 +1218,19 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
         None
     }
 
-    fn advance_stack<const IS_PY: bool>(&mut self, sid: u32, allow_split: bool) -> bool {
+    fn advance_stack(&mut self, sid: u32, allow_split: bool) -> bool {
         let at = self.env.at;
         let stack = self.arena.get_mut(sid);
         let default_reduce = at.fast_state(stack.state).default_reduce;
         if default_reduce > 0 {
-            stack.reduce::<IS_PY, C>(&mut self.env, default_reduce);
+            stack.reduce::<C>(&mut self.env, default_reduce);
             return true;
         }
         if stack.stack.len() >= 2800 {
-            while stack.stack.len() > 2000 && stack.force_reduce::<IS_PY, C>(&mut self.env) {}
+            while stack.stack.len() > 2000 && stack.force_reduce::<C>(&mut self.env) {}
         }
         let start = stack.pos;
-        let n = self.tokens.get_actions::<IS_PY, C>(&mut self.env, stack);
+        let n = self.tokens.get_actions::<C>(&mut self.env, stack);
         if n == 0 {
             return false;
         }
@@ -1635,7 +1240,7 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
             let term = self.tokens.actions[1];
             let end = self.tokens.actions[2];
             let st = main_start.unwrap_or(stack.pos);
-            stack.apply::<IS_PY, C>(&mut self.env, action, term, st, end);
+            stack.apply::<C>(&mut self.env, action, term, st, end);
             return true;
         }
         let mut inline = [0i32; INLINE_ACT_CAP];
@@ -1651,13 +1256,13 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
             if i == n {
                 let s = self.arena.get_mut(sid);
                 let st = main_start.unwrap_or(s.pos);
-                s.apply::<IS_PY, C>(&mut self.env, action, term, st, end);
+                s.apply::<C>(&mut self.env, action, term, st, end);
                 return true;
             }
             let lid = self.arena.split(sid);
             let local = self.arena.get_mut(lid);
             let st = main_start.unwrap_or(local.pos);
-            local.apply::<IS_PY, C>(&mut self.env, action, term, st, end);
+            local.apply::<C>(&mut self.env, action, term, st, end);
             if local.pos > start {
                 self.new_stacks.push(lid);
             } else {
@@ -1667,10 +1272,10 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
         false
     }
 
-    fn advance_fully<const IS_PY: bool>(&mut self, sid: u32) -> bool {
+    fn advance_fully(&mut self, sid: u32) -> bool {
         let pos = self.arena.get(sid).pos;
         loop {
-            if !self.advance_stack::<IS_PY>(sid, false) {
+            if !self.advance_stack(sid, false) {
                 return false;
             }
             if self.arena.get(sid).pos > pos {
@@ -1680,7 +1285,7 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
         }
     }
 
-    fn recover_by_insert<const IS_PY: bool>(&mut self, sid: u32, next: i32) -> Vec<u32> {
+    fn recover_by_insert(&mut self, sid: u32, next: i32) -> Vec<u32> {
         let g = self.env.g;
         let (slen, state, pos) = {
             let s = self.arena.get(sid);
@@ -1726,7 +1331,7 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
             let stack = self.arena.get_mut(lid);
             stack.push_state(s, pos);
             stack.store_node(TERM_ERR, stack.pos, stack.pos, 4, true);
-            stack.shift_context::<IS_PY, C>(&mut self.env, next_states[i], pos);
+            stack.shift_context::<C>(&mut self.env, next_states[i], pos);
             stack.reduce_pos = pos;
             stack.score -= 200;
             result.push(lid);
@@ -1735,7 +1340,7 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
         result
     }
 
-    fn run_recovery<const IS_PY: bool>(&mut self, stacks: &[u32], tokens: &[i32]) -> Option<u32> {
+    fn run_recovery(&mut self, stacks: &[u32], tokens: &[i32]) -> Option<u32> {
         let g = self.env.g;
         let at = self.env.at;
         let mut finished: Option<u32> = None;
@@ -1749,23 +1354,23 @@ impl<'a, 'w, C: Ch> Parse<'a, 'w, C> {
                 }
                 restarted = true;
                 self.arena.get_mut(sid).restart();
-                if self.advance_fully::<IS_PY>(sid) {
+                if self.advance_fully(sid) {
                     continue;
                 }
             }
             let force = self.arena.split(sid);
             let mut force_consumed = false;
             for _ in 0..10 {
-                if !self.arena.get_mut(force).force_reduce::<IS_PY, C>(&mut self.env) {
+                if !self.arena.get_mut(force).force_reduce::<C>(&mut self.env) {
                     break;
                 }
-                if self.advance_fully::<IS_PY>(force) {
+                if self.advance_fully(force) {
                     force_consumed = true;
                     break;
                 }
             }
-            for insert in self.recover_by_insert::<IS_PY>(sid, token) {
-                let _ = self.advance_fully::<IS_PY>(insert);
+            for insert in self.recover_by_insert(sid, token) {
+                let _ = self.advance_fully(insert);
             }
             let spos = self.arena.get(sid).pos;
             if self.env.stream.end > spos {
@@ -1829,14 +1434,10 @@ pub fn parse_into<C: Ch>(g: &'static Grammar, input: &[C], out: &mut SyntaxTree)
                 stopped_tokens: &mut ws.stopped_tokens,
                 work_stacks: &mut ws.work_stacks,
             };
-            if g.kind == Kind::Python {
-                p.run_fast::<true>().unwrap()
-            } else {
-                p.run_fast::<false>().unwrap()
-            }
+            p.run_fast().unwrap()
         };
 
-        ws.arena.get_mut(done_id).close(g.kind == Kind::Python);
+        ws.arena.get_mut(done_id).close(true);
         let end_pos = ws.arena.get(done_id).pos as u32;
         let buf = ws.arena.flatten_into(done_id, &mut ws.flatten_scratch);
         build_tree_into(g, buf, end_pos, out);

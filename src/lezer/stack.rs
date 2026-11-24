@@ -79,15 +79,12 @@ impl Stack {
     }
 
     #[inline]
-    pub fn reduce<const IS_PY: bool, C: Ch>(&mut self, env: &mut Env<C>, action: u32) {
+    pub fn reduce<C: Ch>(&mut self, env: &mut Env<C>, action: u32) {
         let depth = action >> REDUCE_DEPTH_SHIFT;
         let ty = action & VALUE_MASK;
         let g = env.g;
         let lookahead_record =
             self.reduce_pos < self.pos - LOOKAHEAD_MARGIN && self.set_look_ahead(self.pos);
-        if !IS_PY && matches!(ty, 80 | 82 | 94 | 170 | 200) {
-            self.score += 1;
-        }
         let min_repeat = g.min_repeat_term as u32;
         if depth == 0 {
             if ty < min_repeat && self.reduce_pos < self.pos {
@@ -103,9 +100,7 @@ impl Stack {
                     self.store_node(ty as i32, self.reduce_pos, self.reduce_pos, sz, true);
                 }
             }
-            if IS_PY {
-                self.reduce_context_py(env, ty);
-            }
+            self.reduce_context_py(env, ty);
             return;
         }
         let base = self.stack.len()
@@ -153,9 +148,7 @@ impl Stack {
             self.state = g.get_goto_loose(env.gt, base_state, ty);
         }
         self.stack.truncate(base);
-        if IS_PY {
-            self.reduce_context_py(env, ty);
-        }
+        self.reduce_context_py(env, ty);
     }
 
     #[inline]
@@ -221,7 +214,7 @@ impl Stack {
     }
 
     #[inline]
-    pub fn shift<const IS_PY: bool, C: Ch>(
+    pub fn shift<C: Ch>(
         &mut self,
         env: &mut Env<C>,
         action: u32,
@@ -240,13 +233,13 @@ impl Stack {
                 self.reduce_pos = end;
             }
             self.push_state(next_state, if skipped { start } else { start.min(self.reduce_pos) });
-            self.shift_context::<IS_PY, C>(env, ty as u32, start);
+            self.shift_context::<C>(env, ty as u32, start);
             if ty <= g.max_node as i32 {
                 self.buffer.push([ty, start, end, 4]);
             }
         } else {
             self.pos = end;
-            self.shift_context::<IS_PY, C>(env, ty as u32, start);
+            self.shift_context::<C>(env, ty as u32, start);
             if ty <= g.max_node as i32 {
                 self.buffer.push([ty, start, end, 4]);
             }
@@ -254,7 +247,7 @@ impl Stack {
     }
 
     #[inline(always)]
-    pub fn apply<const IS_PY: bool, C: Ch>(
+    pub fn apply<C: Ch>(
         &mut self,
         env: &mut Env<C>,
         action: u32,
@@ -263,9 +256,9 @@ impl Stack {
         next_end: i32,
     ) {
         if action & REDUCE_FLAG != 0 {
-            self.reduce::<IS_PY, C>(env, action);
+            self.reduce::<C>(env, action);
         } else {
-            self.shift::<IS_PY, C>(env, action, next, next_start, next_end);
+            self.shift::<C>(env, action, next, next_start, next_end);
         }
     }
 
@@ -313,7 +306,7 @@ impl Stack {
         }
     }
 
-    pub fn force_reduce<const IS_PY: bool, C: Ch>(&mut self, env: &mut Env<C>) -> bool {
+    pub fn force_reduce<C: Ch>(&mut self, env: &mut Env<C>) -> bool {
         let g = env.g;
         let mut reduce = g.state_slot(self.state, 5);
         if reduce & REDUCE_FLAG == 0 {
@@ -333,7 +326,7 @@ impl Stack {
             self.score -= 100;
         }
         self.reduce_pos = self.pos;
-        self.reduce::<IS_PY, C>(env, reduce);
+        self.reduce::<C>(env, reduce);
         true
     }
 
@@ -366,9 +359,9 @@ impl Stack {
         })
     }
 
-    pub fn force_all<const IS_PY: bool, C: Ch>(&mut self, env: &mut Env<C>) {
+    pub fn force_all<C: Ch>(&mut self, env: &mut Env<C>) {
         while (env.at.fast_state(self.state).flags & STATE_ACCEPTING) == 0 {
-            if !self.force_reduce::<IS_PY, C>(env) {
+            if !self.force_reduce::<C>(env) {
                 self.store_node(TERM_ERR, self.pos, self.pos, 4, true);
                 break;
             }
@@ -402,14 +395,7 @@ impl Stack {
     }
 
     #[inline(always)]
-    pub fn shift_context<const IS_PY: bool, C: Ch>(&mut self, env: &mut Env<C>, term: u32, start: i32) {
-        if !IS_PY {
-            // JS context tracker: `5 = LineComment`, `6 = BlockComment`, `321 = spaces`, `322 = newline`.
-            if term != 5 && term != 6 && term != 321 {
-                self.ctx = (term == 322) as u32;
-            }
-            return;
-        }
+    pub fn shift_context<C: Ch>(&mut self, env: &mut Env<C>, term: u32, start: i32) {
         let cx = env.tracker_shift_py(self.ctx, term, self.pos, start);
         if cx != self.ctx {
             self.update_context_changed_py(env, cx);
