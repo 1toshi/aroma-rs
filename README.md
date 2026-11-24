@@ -70,12 +70,17 @@ aroma search ./src --file src/lib.rs --lines 10-35 --json
 # Cluster matching implementations into idiomatic code recommendations
 aroma recommend ./src --file src/lib.rs --lines 10-35 --json
 
+# Lint changed code for EXISTING functions that already do the same thing (exit 4 on findings)
+aroma check --diff .                         # uncommitted edits + untracked files vs HEAD
+aroma check --diff origin/main src           # everything on this branch
+aroma check src/lib.rs:10-35 src --json      # explicit FILE[:LINES]; a bare FILE means every line
+
 # Run reproducible corpus manifest / query benchmark suite
 aroma bench --manifest /path/to/corpus_manifest.json --queries /path/to/queries.json --threads 15
 ```
 
 - **Stdout vs. Stderr**: JSON commands (`--robot-triage`, `--json`, `bench`) write pure deterministic JSON strictly to `stdout`; alias notes, env warnings, and teaching errors go strictly to `stderr`.
-- **Exit codes**: `0` (`success`, including valid queries with 0 matches), `1` (`user-input-error`), `2` (`safety-block`, reserved), `3` (`tool-environment-error`).
+- **Exit codes**: `0` (`success`, including valid queries with 0 matches), `1` (`user-input-error`), `2` (`safety-block`, reserved), `3` (`tool-environment-error`), `4` (`findings`: `check` found changed functions with likely existing equivalents; `--no-fail` forces `0`).
 - **Environment variables**: `AROMA_ROBOT=1` (default to `--json`), `AROMA_THREADS=<N>`, `AROMA_NO_ENV_WARN=1`.
 
 ## Native Rust (`.rs`) Front End

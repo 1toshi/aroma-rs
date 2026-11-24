@@ -133,7 +133,7 @@ def process_scores(scores):
 
 #[test]
 fn bare_help_and_version_exit_cleanly_without_ansi() {
-    for args in [&[][..], &["--help"][..], &["-h"][..], &["help"][..], &["help", "search"][..], &["search", "--help"][..], &["--version"][..]] {
+    for args in [&[][..], &["--help"][..], &["-h"][..], &["help"][..], &["help", "search"][..], &["search", "--help"][..], &["help", "check"][..], &["check", "--help"][..], &["--version"][..]] {
         let out = run_aroma(args, &[], None);
         assert_eq!(out.status.code(), Some(0), "failed for {args:?}");
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -157,10 +157,10 @@ fn capabilities_robot_docs_and_schema_contracts() {
     assert!(v["languages"]["rust"].is_object());
     assert!(v["languages"]["python"].is_object());
     assert!(v["languages"]["typescript"].is_object());
-    for cmd in ["triage", "clones", "search", "recommend", "capabilities", "robot-docs", "schema", "bench"] {
+    for cmd in ["triage", "clones", "search", "recommend", "check", "capabilities", "robot-docs", "schema", "bench"] {
         assert!(v["commands"][cmd].is_object(), "missing command {cmd}");
     }
-    for ec in ["0", "1", "2", "3"] {
+    for ec in ["0", "1", "2", "3", "4"] {
         assert!(v["exit_codes"][ec].is_object(), "missing exit code {ec}");
     }
     assert!(v["flags"]["global"]["--robot-triage"].is_object());
@@ -182,6 +182,11 @@ fn capabilities_robot_docs_and_schema_contracts() {
     assert_eq!(schema_one.status.code(), Some(0));
     let sov: Value = serde_json::from_slice(&schema_one.stdout).expect("single schema JSON");
     assert_eq!(sov["command"], "triage");
+
+    let schema_check = run_aroma(&["schema", "--command", "check", "--json"], &[], None);
+    assert_eq!(schema_check.status.code(), Some(0));
+    let scv: Value = serde_json::from_slice(&schema_check.stdout).expect("check schema JSON");
+    assert!(scv["stdout_schema"]["properties"]["findings"].is_object());
 }
 
 #[test]
@@ -448,4 +453,168 @@ fn bench_subcommand_preserves_json_output_contract() {
     assert_eq!(v["stats"]["files"], 1);
     assert_eq!(v["errors"], 0);
     assert!(v["work_checksum"].as_u64().is_some());
+}
+
+fn run_aroma_in(cwd: &Path, args: &[&str]) -> Output {
+    Command::new(aroma_bin())
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("AROMA_ROBOT")
+        .env_remove("AROMA_THREADS")
+        .env_remove("AROMA_NO_ENV_WARN")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run aroma")
+}
+
+fn git(cwd: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(["-c", "user.name=aroma-test", "-c", "user.email=aroma@test.invalid", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", cwd)
+        .output()
+        .expect("spawn git");
+    assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// `sum_scaled_positives` from the multi-lang fixture, alpha-renamed under a new name.
+const DUPLICATE_FN: &str = r#"
+pub fn average_even_tripled(nums: &[i32]) -> i32 {
+    let mut sum = 0;
+    let mut n = 0;
+    for &x in nums {
+        if x > 0 && x % 2 == 0 {
+            sum += x * 3;
+            n += 1;
+        }
+    }
+    if n > 0 {
+        sum / n
+    } else {
+        sum.max(0)
+    }
+}
+"#;
+
+#[test]
+fn check_file_lines_reports_existing_equivalent_and_gates_exit_code() {
+    let dir = TempDir::new("check_lines");
+    write_multi_lang_fixture(&dir);
+    dir.write("src/small.rs", "pub fn one() -> i32 {\n    1\n}\n");
+    let root = dir.path.to_str().expect("utf8");
+    let a = dir.path.join("src/a.rs");
+    let a_lines = format!("{}:2-17", a.to_str().expect("utf8"));
+
+    // (a) human output names the existing near-identical function and exits 4.
+    let human = run_aroma(&["check", &a_lines, root], &[], None);
+    assert_eq!(human.status.code(), Some(4), "stderr: {}", String::from_utf8_lossy(&human.stderr));
+    let txt = String::from_utf8_lossy(&human.stdout);
+    assert!(txt.contains("compute_total"), "stdout: {txt}");
+    assert!(txt.contains("consider reusing"), "stdout: {txt}");
+    assert!(txt.contains("sum_scaled_positives"), "stdout: {txt}");
+    assert!(txt.contains("1 changed function checked, 1 with likely existing equivalents"), "stdout: {txt}");
+
+    // --no-fail keeps the report but exits 0.
+    let no_fail = run_aroma(&["check", &a_lines, root, "--no-fail"], &[], None);
+    assert_eq!(no_fail.status.code(), Some(0));
+    assert_eq!(no_fail.stdout, human.stdout);
+
+    // (d) JSON envelope with findings and matches at the default 0.71 threshold.
+    let json = run_aroma(&["check", &a_lines, root, "--json"], &[], None);
+    assert_eq!(json.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&json.stdout).expect("check json");
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["checked"], 1);
+    assert_eq!(v["findings"][0]["changed"]["name"], "compute_total");
+    assert_eq!(v["findings"][0]["matches"][0]["method"]["name"], "sum_scaled_positives");
+    assert!(v["findings"][0]["matches"][0]["similarity"].as_f64().expect("sim") >= 0.71);
+
+    // (e) matches inside test files are excluded unless --include-tests: here the only
+    // equivalent of the changed function lives in tests/sample_test.rs.
+    let tdir = TempDir::new("check_tests");
+    let t_a = tdir.write("src/a.rs", &fs::read_to_string(&a).expect("read a.rs"));
+    tdir.write("tests/sample_test.rs", &fs::read_to_string(dir.path.join("tests/sample_test.rs")).expect("read test"));
+    let t_root = tdir.path.to_str().expect("utf8");
+    let t_lines = format!("{}:2-17", t_a.to_str().expect("utf8"));
+    let no_tests = run_aroma(&["check", &t_lines, t_root, "--json"], &[], None);
+    assert_eq!(no_tests.status.code(), Some(0));
+    let nv: Value = serde_json::from_slice(&no_tests.stdout).expect("check json without tests");
+    assert_eq!(nv["checked"], 1);
+    assert!(nv["findings"].as_array().expect("findings").is_empty(), "{}", nv["findings"]);
+    let with_tests = run_aroma(&["check", &t_lines, t_root, "--include-tests", "--json"], &[], None);
+    assert_eq!(with_tests.status.code(), Some(4));
+    let wv: Value = serde_json::from_slice(&with_tests.stdout).expect("check json with tests");
+    assert_eq!(wv["findings"][0]["matches"][0]["method"]["name"], "compute_total_check");
+    assert_eq!(wv["findings"][0]["matches"][0]["method"]["path"].as_str().map(|p| p.ends_with("tests/sample_test.rs")), Some(true));
+
+    // (b) a changed method below --min-size is skipped, not searched, and exits 0.
+    let small = dir.path.join("src/small.rs");
+    let small_out = run_aroma(&["check", small.to_str().expect("utf8"), root, "--json"], &[], None);
+    assert_eq!(small_out.status.code(), Some(0));
+    let sv: Value = serde_json::from_slice(&small_out.stdout).expect("small json");
+    assert_eq!(sv["checked"], 0);
+    assert_eq!(sv["skipped_small"], 1);
+    assert!(sv["findings"].as_array().expect("findings").is_empty());
+    let big_min = run_aroma(&["check", &a_lines, root, "--min-size", "100000"], &[], None);
+    assert_eq!(big_min.status.code(), Some(0));
+}
+
+#[test]
+fn check_diff_reports_preexisting_function_not_new_code() {
+    let dir = TempDir::new("check_diff");
+    write_multi_lang_fixture(&dir);
+    git(&dir.path, &["init", "-q"]);
+    git(&dir.path, &["add", "."]);
+    git(&dir.path, &["commit", "-q", "-m", "corpus"]);
+
+    // Uncommitted edit to a tracked file adds a duplicate; an untracked file adds another copy.
+    let b = dir.path.join("src/b.rs");
+    let mut b_src = fs::read_to_string(&b).expect("read b.rs");
+    b_src.push_str(DUPLICATE_FN);
+    fs::write(&b, b_src).expect("write b.rs");
+    dir.write("src/fresh.rs", &DUPLICATE_FN.replace("average_even_tripled", "fresh_copy"));
+    dir.write("notes.txt", "not code\n");
+
+    let out = run_aroma_in(&dir.path, &["check", "--diff", ".", "--json"]);
+    assert_eq!(out.status.code(), Some(4), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v: Value = serde_json::from_slice(&out.stdout).expect("diff json");
+    assert_eq!(v["source"], "git_diff");
+    assert_eq!(v["base"], "HEAD");
+    let findings = v["findings"].as_array().expect("findings");
+    let changed: Vec<&str> = findings.iter().map(|f| f["changed"]["name"].as_str().expect("name")).collect();
+    assert!(changed.contains(&"average_even_tripled"), "{changed:?}");
+    assert!(changed.contains(&"fresh_copy"), "{changed:?}");
+    // Unchanged pre-existing code in an edited file is not a changed function.
+    assert!(!changed.contains(&"sum_scaled_positives"), "{changed:?}");
+    for f in findings {
+        let matched: Vec<&str> = f["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .map(|m| m["method"]["name"].as_str().expect("name"))
+            .collect();
+        assert!(matched.contains(&"compute_total"), "{matched:?}");
+        assert!(matched.contains(&"sum_scaled_positives"), "{matched:?}");
+        assert!(!matched.contains(&"average_even_tripled"), "new code matched: {matched:?}");
+        assert!(!matched.contains(&"fresh_copy"), "new code matched: {matched:?}");
+    }
+    assert!(
+        v["warnings"].as_array().expect("warnings").iter().any(|w| w["code"] == "unsupported_changed_files"),
+        "{}",
+        v["warnings"]
+    );
+
+    // Staged-only mode sees nothing until the edit is staged.
+    let staged = run_aroma_in(&dir.path, &["check", "--diff", "--staged", ".", "--json"]);
+    assert_eq!(staged.status.code(), Some(0));
+    let sv: Value = serde_json::from_slice(&staged.stdout).expect("staged json");
+    assert_eq!(sv["changed_files"], 0);
+
+    // Explicit base revision as a positional; an unknown revision is a user-input error.
+    let head = run_aroma_in(&dir.path, &["check", "--diff", "HEAD", "."]);
+    assert_eq!(head.status.code(), Some(4));
+    let bad = run_aroma_in(&dir.path, &["check", "--diff=no-such-rev", "."]);
+    assert_eq!(bad.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&bad.stderr));
 }

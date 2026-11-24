@@ -10,7 +10,9 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use args::{parse_args, Action};
-use commands::{run_bench, run_clones, run_recommend, run_search, run_triage, CommandOutcome};
+use commands::{
+    run_bench, run_check, run_clones, run_recommend, run_search, run_triage, CommandOutcome,
+};
 use docs::{render_capabilities, render_help, render_robot_docs, render_schema, version_string};
 use error::{CliError, ExitKind};
 
@@ -45,6 +47,7 @@ pub(crate) fn run(args: &[String], env: &[(String, String)], stdin_is_tty: bool)
         Action::Clones(cmd) => run_clones(&cmd),
         Action::Search(cmd) => run_search(&cmd),
         Action::Recommend(cmd) => run_recommend(&cmd),
+        Action::Check(cmd) => run_check(&cmd),
         Action::Bench(cmd) => run_bench(&cmd),
     };
 

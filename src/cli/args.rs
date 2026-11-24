@@ -18,6 +18,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "clones",
     "search",
     "recommend",
+    "check",
     "capabilities",
     "robot-docs",
     "schema",
@@ -58,6 +59,7 @@ pub(crate) enum HelpTopic {
     Clones,
     Search,
     Recommend,
+    Check,
     Capabilities,
     RobotDocs,
     Schema,
@@ -75,6 +77,7 @@ pub(crate) enum SchemaCommand {
     Clones,
     Search,
     Recommend,
+    Check,
     Capabilities,
     Bench,
 }
@@ -86,6 +89,7 @@ impl SchemaCommand {
             Self::Clones => "clones",
             Self::Search => "search",
             Self::Recommend => "recommend",
+            Self::Check => "check",
             Self::Capabilities => "capabilities",
             Self::Bench => "bench",
         }
@@ -163,6 +167,39 @@ pub(crate) struct RecommendCmd {
     pub(crate) max_file_bytes: usize,
 }
 
+/// Changed-code discovery for `aroma check --diff`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiffSpec {
+    /// Explicit base from `--diff=<REF>`; `None` defers to the positional heuristic, then `HEAD`.
+    pub(crate) base: Option<String>,
+    pub(crate) staged: bool,
+}
+
+/// One `aroma check` positional: `FILE:LINES` carries its parsed lines; bare tokens are
+/// classified at run time (regular file = whole-file target, otherwise corpus PATH or diff base).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckArg {
+    pub(crate) path: PathBuf,
+    pub(crate) lines: Option<Vec<u32>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CheckCmd {
+    pub(crate) diff: Option<DiffSpec>,
+    pub(crate) args: Vec<CheckArg>,
+    pub(crate) mode: OutputMode,
+    pub(crate) threads: Option<usize>,
+    pub(crate) top: usize,
+    pub(crate) search_limit: usize,
+    pub(crate) min_sim: f64,
+    pub(crate) min_size: usize,
+    pub(crate) tests: TestFilter,
+    pub(crate) fail_on_findings: bool,
+    pub(crate) lang: Option<String>,
+    pub(crate) ignores: Vec<String>,
+    pub(crate) max_file_bytes: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BenchCmd {
     pub(crate) manifest: PathBuf,
@@ -182,6 +219,7 @@ pub(crate) enum Action {
     Clones(ClonesCmd),
     Search(SearchCmd),
     Recommend(RecommendCmd),
+    Check(CheckCmd),
     Bench(BenchCmd),
 }
 
@@ -198,6 +236,7 @@ enum Subcmd {
     Clones,
     Search,
     Recommend,
+    Check,
     Capabilities,
     RobotDocs,
     Schema,
@@ -212,6 +251,7 @@ impl Subcmd {
             Self::Clones => HelpTopic::Clones,
             Self::Search => HelpTopic::Search,
             Self::Recommend => HelpTopic::Recommend,
+            Self::Check => HelpTopic::Check,
             Self::Capabilities => HelpTopic::Capabilities,
             Self::RobotDocs => HelpTopic::RobotDocs,
             Self::Schema => HelpTopic::Schema,
@@ -226,6 +266,7 @@ impl Subcmd {
             Self::Clones => "clones",
             Self::Search => "search",
             Self::Recommend => "recommend",
+            Self::Check => "check",
             Self::Capabilities => "capabilities",
             Self::RobotDocs => "robot-docs",
             Self::Schema => "schema",
@@ -257,6 +298,7 @@ fn resolve_subcommand(raw: &str, notes: &mut Vec<String>) -> Option<Subcmd> {
             notes.push(format!("note: '{raw}' interpreted as 'recommend' (alias)"));
             Some(Subcmd::Recommend)
         }
+        "check" => Some(Subcmd::Check),
         "capabilities" => Some(Subcmd::Capabilities),
         "caps" | "info" => {
             notes.push(format!("note: '{raw}' interpreted as 'capabilities' (alias)"));
@@ -567,6 +609,11 @@ struct CommonOpts {
     lines: Option<Vec<u32>>,
     manifest: Option<PathBuf>,
     queries: Option<PathBuf>,
+    diff: bool,
+    diff_base: Option<String>,
+    staged: bool,
+    min_size: Option<usize>,
+    no_fail: bool,
     positionals: Vec<String>,
 }
 
@@ -585,6 +632,7 @@ fn parse_common_flag(
             "clones" => HelpTopic::Clones,
             "search" => HelpTopic::Search,
             "recommend" => HelpTopic::Recommend,
+            "check" => HelpTopic::Check,
             "capabilities" => HelpTopic::Capabilities,
             "robot-docs" => HelpTopic::RobotDocs,
             "schema" => HelpTopic::Schema,
@@ -780,6 +828,46 @@ fn parse_common_flag(
             opts.queries = Some(PathBuf::from(v));
             Ok(None)
         }
+        "--diff" => {
+            if !allowed.contains(&"--diff") {
+                return Err(unknown_flag_error(flag, allowed, subcmd));
+            }
+            opts.diff = true;
+            if let Some(base) = inline {
+                if base.is_empty() {
+                    return Err(CliError::user_input(
+                        "empty git revision in '--diff='",
+                        "Use '--diff' alone for uncommitted changes against HEAD, or '--diff=<REF>' for another base",
+                        "aroma check --diff=origin/main .",
+                        "aroma check --help",
+                    ));
+                }
+                opts.diff_base = Some(base.to_string());
+            }
+            Ok(None)
+        }
+        "--staged" => {
+            if !allowed.contains(&"--staged") {
+                return Err(unknown_flag_error(flag, allowed, subcmd));
+            }
+            opts.staged = true;
+            Ok(None)
+        }
+        "--min-size" => {
+            if !allowed.contains(&"--min-size") {
+                return Err(unknown_flag_error(flag, allowed, subcmd));
+            }
+            let v = ts.take_val(inline, "--min-size", subcmd)?;
+            opts.min_size = Some(parse_int_bounded("--min-size", &v, 0usize, 100_000, subcmd)?);
+            Ok(None)
+        }
+        "--no-fail" => {
+            if !allowed.contains(&"--no-fail") {
+                return Err(unknown_flag_error(flag, allowed, subcmd));
+            }
+            opts.no_fail = true;
+            Ok(None)
+        }
         _ => Err(unknown_flag_error(flag, allowed, subcmd)),
     }
 }
@@ -807,6 +895,12 @@ fn allowed_flags_for(subcmd: Subcmd) -> &'static [&'static str] {
             "--search-limit", "--cluster-limit", "--min-sim", "--min-support", "--include-origin",
             "--lang", "--language", "--snippet", "--snippet-file", "--file", "--lines", "--ignore",
             "--max-file-bytes", "--help", "--version",
+        ],
+        Subcmd::Check => &[
+            "--json", "--robot", "--format", "--no-color", "--threads", "--top", "--limit",
+            "--search-limit", "--min-sim", "--min-size", "--diff", "--staged", "--no-fail",
+            "--include-tests", "--lang", "--language", "--ignore", "--max-file-bytes", "--help",
+            "--version",
         ],
         Subcmd::Capabilities => &["--json", "--robot", "--format", "--no-color", "--help", "--version"],
         Subcmd::RobotDocs => &["--no-color", "--help", "--version"],
@@ -958,7 +1052,7 @@ pub(crate) fn parse_args(
                 }
                 return Err(CliError::user_input(
                     format!("unknown command '{raw}'"),
-                    "Expected a subcommand (triage, clones, search, recommend, capabilities, robot-docs, schema, bench)",
+                    "Expected a subcommand (triage, clones, search, recommend, check, capabilities, robot-docs, schema, bench)",
                     "aroma --robot-triage .",
                     "aroma --help",
                 ));
@@ -1100,6 +1194,40 @@ pub(crate) fn parse_args(
                 max_file_bytes: opts.max_file_bytes.unwrap_or(DEFAULT_MAX_FILE_BYTES),
             })
         }
+        Subcmd::Check => {
+            let args = parse_check_positionals(&opts.positionals, opts.diff)?;
+            if opts.staged && !opts.diff {
+                return Err(CliError::user_input(
+                    "'--staged' requires '--diff'",
+                    "--staged narrows git diff discovery to the index; explicit FILE[:LINES] targets have no staging state",
+                    "aroma check --diff --staged .",
+                    "aroma check --help",
+                ));
+            }
+            if !opts.diff && args.is_empty() {
+                return Err(CliError::user_input(
+                    "'check' requires '--diff' or at least one FILE[:LINES] target",
+                    "Name changed code explicitly (FILE, FILE:12, FILE:10-25,30) or discover it from git with --diff",
+                    "aroma check --diff .",
+                    "aroma check --help",
+                ));
+            }
+            Action::Check(CheckCmd {
+                diff: opts.diff.then_some(DiffSpec { base: opts.diff_base, staged: opts.staged }),
+                args,
+                mode,
+                threads,
+                top: opts.top.unwrap_or(3),
+                search_limit: opts.search_limit.unwrap_or(1000),
+                min_sim: opts.min_sim.unwrap_or(0.71),
+                min_size: opts.min_size.unwrap_or(30),
+                tests: opts.tests.unwrap_or(TestFilter::ExcludeTests),
+                fail_on_findings: !opts.no_fail,
+                lang: opts.lang,
+                ignores: opts.ignores,
+                max_file_bytes: opts.max_file_bytes.unwrap_or(DEFAULT_MAX_FILE_BYTES),
+            })
+        }
         Subcmd::Capabilities => Action::Capabilities(mode),
         Subcmd::RobotDocs => {
             if let Some(topic) = opts.positionals.first()
@@ -1150,20 +1278,50 @@ pub(crate) fn parse_args(
     Ok(ParsedRun { action, notes })
 }
 
+/// Splits `aroma check` positionals into `FILE:LINES` targets and bare paths. A trailing
+/// `:<digits,->` suffix is a line spec; with `--diff` such targets are rejected because git
+/// supplies the changed lines.
+fn parse_check_positionals(positionals: &[String], diff: bool) -> Result<Vec<CheckArg>, CliError> {
+    let mut out = Vec::with_capacity(positionals.len());
+    for raw in positionals {
+        let spec = raw.rsplit_once(':').filter(|(file, spec)| {
+            !file.is_empty()
+                && !spec.is_empty()
+                && spec.bytes().all(|b| b.is_ascii_digit() || b == b',' || b == b'-')
+        });
+        match spec {
+            Some((file, spec)) => {
+                if diff {
+                    return Err(CliError::user_input(
+                        format!("'{raw}' names explicit lines, which conflicts with '--diff'"),
+                        "With --diff, git supplies the changed lines; positionals are an optional base revision and corpus PATHs",
+                        format!("aroma check {raw} ."),
+                        "aroma check --help",
+                    ));
+                }
+                out.push(CheckArg { path: PathBuf::from(file), lines: Some(parse_line_spec(spec)?) });
+            }
+            None => out.push(CheckArg { path: PathBuf::from(raw), lines: None }),
+        }
+    }
+    Ok(out)
+}
+
 fn parse_schema_cmd(raw: &str) -> Result<SchemaCommand, CliError> {
     match raw {
         "triage" => Ok(SchemaCommand::Triage),
         "clones" => Ok(SchemaCommand::Clones),
         "search" => Ok(SchemaCommand::Search),
         "recommend" => Ok(SchemaCommand::Recommend),
+        "check" => Ok(SchemaCommand::Check),
         "capabilities" => Ok(SchemaCommand::Capabilities),
         "bench" => Ok(SchemaCommand::Bench),
         _ => {
-            let candidates = ["triage", "clones", "search", "recommend", "capabilities", "bench"];
+            let candidates = ["triage", "clones", "search", "recommend", "check", "capabilities", "bench"];
             let try_cmd = closest_match(raw, &candidates, 2).unwrap_or("triage");
             Err(CliError::user_input(
                 format!("unknown schema command '{raw}'"),
-                "Expected one of: triage, clones, search, recommend, capabilities, bench",
+                "Expected one of: triage, clones, search, recommend, check, capabilities, bench",
                 format!("aroma schema --command {try_cmd} --json"),
                 "aroma capabilities --json",
             ))
