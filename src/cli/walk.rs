@@ -87,7 +87,8 @@ pub(crate) fn infer_language_for_path(path: &str) -> Option<&'static str> {
 }
 
 pub(crate) fn is_test_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
+    // Anchor at `/` so root-relative display paths (`tests/x.rs` from walking `.`) match `/tests/`.
+    let lower = format!("/{}", path.to_ascii_lowercase());
     let filename = lower.rsplit('/').next().unwrap_or(&lower);
     lower.contains("/test/")
         || lower.contains("/tests/")

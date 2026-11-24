@@ -10,14 +10,16 @@ pub(crate) enum ExitKind {
     UserInput = 1,
     SafetyBlock = 2,
     ToolEnv = 3,
+    Findings = 4,
 }
 
 impl ExitKind {
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::Success,
         Self::UserInput,
         Self::SafetyBlock,
         Self::ToolEnv,
+        Self::Findings,
     ];
 
     pub(crate) const fn code(self) -> u8 {
@@ -26,6 +28,7 @@ impl ExitKind {
             Self::UserInput => 1,
             Self::SafetyBlock => 2,
             Self::ToolEnv => 3,
+            Self::Findings => 4,
         }
     }
 
@@ -35,12 +38,13 @@ impl ExitKind {
             Self::UserInput => "user-input-error",
             Self::SafetyBlock => "safety-block",
             Self::ToolEnv => "tool-environment-error",
+            Self::Findings => "findings",
         }
     }
 
     pub(crate) const fn retryable(self) -> bool {
         match self {
-            Self::Success | Self::UserInput | Self::SafetyBlock => false,
+            Self::Success | Self::UserInput | Self::SafetyBlock | Self::Findings => false,
             Self::ToolEnv => true,
         }
     }
@@ -51,6 +55,7 @@ impl ExitKind {
             Self::UserInput => "Unknown flag/command, missing argument, or out-of-range limit",
             Self::SafetyBlock => "Reserved safety gate; aroma CLI is read-only",
             Self::ToolEnv => "Unreadable/missing target path or malformed JSON file",
+            Self::Findings => "`aroma check` found changed functions with likely existing equivalents (suppress with --no-fail)",
         }
     }
 

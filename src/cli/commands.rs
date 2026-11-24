@@ -1,4 +1,4 @@
-//! Command execution shell (`triage`, `clones`, `search`, `recommend`, `bench`).
+//! Command execution shell (`triage`, `clones`, `search`, `recommend`, `check`, `bench`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -6,6 +6,7 @@ use std::fs;
 use std::hint::black_box;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
 use aroma::{
@@ -18,13 +19,13 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::args::{
-    BenchCmd, ClonesCmd, OriginFilter, OutputMode, QuerySource, RecommendCmd, RecsMode, SearchCmd,
-    TestFilter, TriageCmd, MAX_SNIPPET_BYTES,
+    BenchCmd, CheckCmd, ClonesCmd, DiffSpec, OriginFilter, OutputMode, QuerySource, RecommendCmd,
+    RecsMode, SearchCmd, TestFilter, TriageCmd, MAX_SNIPPET_BYTES,
 };
 use crate::cli::error::{closest_match, CliError, ExitKind};
 use crate::cli::walk::{
-    infer_language_for_path, is_test_path, read_file_bounded, walk_paths, WalkOptions, WalkResult,
-    WarningItem,
+    infer_language_for_path, is_test_path, normalize_display_path, read_file_bounded, walk_paths,
+    WalkOptions, WalkResult, WarningItem,
 };
 
 #[must_use]
@@ -1052,7 +1053,7 @@ fn read_stdin_bounded() -> Result<String, CliError> {
 }
 
 fn resolve_indexed_file_idx(walk: &WalkResult, target: &Path) -> Result<usize, CliError> {
-    let norm = crate::cli::walk::normalize_display_path(target);
+    let norm = normalize_display_path(target);
     if let Some(pos) = walk.files.iter().position(|f| f.path == norm) {
         return Ok(pos);
     }
@@ -1667,6 +1668,566 @@ pub(crate) fn run_recommend(cmd: &RecommendCmd) -> Result<CommandOutcome, CliErr
         exit: ExitKind::Success,
         stdout,
         stderr_notes: ctx.resolved.notes,
+    })
+}
+
+/// One changed file for `aroma check`; `lines: None` means every line of the file.
+struct CheckTarget {
+    path: PathBuf,
+    lines: Option<Vec<u32>>,
+}
+
+/// Where a resolved check target's source text lives.
+enum TargetSource {
+    Indexed(usize),
+    External(SourceFile),
+}
+
+struct ResolvedTarget {
+    source: TargetSource,
+    lines: Option<Vec<u32>>,
+}
+
+impl ResolvedTarget {
+    fn file<'a>(&'a self, walk: &'a WalkResult) -> &'a SourceFile {
+        match &self.source {
+            TargetSource::Indexed(i) => &walk.files[*i],
+            TargetSource::External(sf) => sf,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CheckMatchOut {
+    method: MethodRefOut,
+    similarity: f64,
+    matched_lines: Vec<u32>,
+}
+
+#[derive(Serialize)]
+struct CheckFindingOut {
+    changed: MethodRefOut,
+    changed_lines: Vec<u32>,
+    query_size: usize,
+    matches: Vec<CheckMatchOut>,
+}
+
+/// Groups per-file skip reasons into one warning per code instead of one per file.
+#[derive(Default)]
+struct SkipLog {
+    by_code: BTreeMap<&'static str, (&'static str, Vec<String>)>,
+}
+
+impl SkipLog {
+    fn push(&mut self, code: &'static str, reason: &'static str, path: String) {
+        self.by_code.entry(code).or_insert((reason, Vec::new())).1.push(path);
+    }
+
+    fn into_warnings(self) -> Vec<WarningItem> {
+        self.by_code
+            .into_iter()
+            .map(|(code, (reason, paths))| {
+                let shown: Vec<&str> = paths.iter().take(5).map(String::as_str).collect();
+                let more = paths.len() - shown.len();
+                let tail = if more > 0 { format!(", +{more} more") } else { String::new() };
+                WarningItem {
+                    code: code.to_string(),
+                    message: format!("{} changed file(s) {reason}: {}{tail}", paths.len(), shown.join(", ")),
+                }
+            })
+            .collect()
+    }
+}
+
+fn run_git(dir: &Path, args: &[&str]) -> Result<std::process::Output, CliError> {
+    Command::new("git").arg("-C").arg(dir).args(args).output().map_err(|e| {
+        CliError::tool_env(
+            format!("failed to run git: {e}"),
+            "`aroma check --diff` shells out to git to discover changed lines; git must be on PATH",
+            "aroma check <FILE>:<LINES> .",
+            "aroma check --help",
+        )
+    })
+}
+
+fn git_stderr_line(out: &std::process::Output) -> String {
+    let err = String::from_utf8_lossy(&out.stderr);
+    err.lines().find(|l| !l.trim().is_empty()).unwrap_or("git exited with an error").trim().to_string()
+}
+
+/// Decodes a git C-quoted path (`"dir/caf\303\251.rs"`); unquoted input is returned as-is.
+fn unquote_git_path(raw: &str) -> Option<String> {
+    let Some(inner) = raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else {
+        return Some(raw.to_string());
+    };
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != b'\\' {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        let esc = *bytes.get(i + 1)?;
+        if esc.is_ascii_digit() {
+            let mut v: u32 = 0;
+            for &d in bytes.get(i + 1..i + 4)? {
+                if !(b'0'..=b'7').contains(&d) {
+                    return None;
+                }
+                v = v * 8 + u32::from(d - b'0');
+            }
+            out.push(u8::try_from(v).ok()?);
+            i += 4;
+            continue;
+        }
+        out.push(match esc {
+            b'n' => b'\n',
+            b't' => b'\t',
+            b'r' => b'\r',
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'v' => 0x0b,
+            other => other,
+        });
+        i += 2;
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Parses the new-side `+c[,d]` range of a `@@ -a,b +c,d @@` hunk header.
+fn parse_hunk_new_range(line: &str) -> Option<(u32, u32)> {
+    let rest = line.strip_prefix("@@ -")?;
+    let new = &rest[rest.find(" +")? + 2..];
+    let spec = &new[..new.find(' ').unwrap_or(new.len())];
+    match spec.split_once(',') {
+        Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+        None => Some((spec.parse().ok()?, 1)),
+    }
+}
+
+/// Extracts new-side changed lines per file from `git diff --unified=0` output. Paths are
+/// repo-root relative; files whose hunks exceed `MAX_LINE_SPEC_COUNT` lines degrade to whole-file.
+fn parse_unified_zero_diff(diff: &str) -> Vec<CheckTarget> {
+    let mut out: Vec<CheckTarget> = Vec::new();
+    let mut in_header = false;
+    let mut current: Option<usize> = None;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            in_header = true;
+            current = None;
+            continue;
+        }
+        if in_header && let Some(raw) = line.strip_prefix("+++ ") {
+            let raw = raw.strip_suffix('\t').unwrap_or(raw);
+            current = unquote_git_path(raw)
+                .and_then(|p| p.strip_prefix("b/").map(str::to_string))
+                .map(|p| {
+                    out.push(CheckTarget { path: PathBuf::from(p), lines: Some(Vec::new()) });
+                    out.len() - 1
+                });
+            continue;
+        }
+        if line.starts_with("@@ ") {
+            in_header = false;
+            let (Some(ci), Some((start, count))) = (current, parse_hunk_new_range(line)) else {
+                continue;
+            };
+            let target = &mut out[ci].lines;
+            if let Some(lines) = target {
+                if lines.len().saturating_add(count as usize) > crate::cli::args::MAX_LINE_SPEC_COUNT {
+                    *target = None;
+                } else {
+                    lines.extend(start..start.saturating_add(count));
+                }
+            }
+        }
+    }
+    out.retain(|t| t.lines.as_ref().is_none_or(|l| !l.is_empty()));
+    out
+}
+
+/// Runs git in the repository containing `hint_dir` and returns changed files as paths
+/// relative to the current directory when possible (absolute otherwise).
+fn discover_git_changes(diff: &DiffSpec, base: &str, hint_dir: &Path) -> Result<Vec<CheckTarget>, CliError> {
+    let top_out = run_git(hint_dir, &["rev-parse", "--show-toplevel"])?;
+    if !top_out.status.success() {
+        return Err(CliError::tool_env(
+            format!("'{}' is not inside a git work tree: {}", hint_dir.display(), git_stderr_line(&top_out)),
+            "`aroma check --diff` reads changed lines from `git diff`; run it inside a git repository",
+            "aroma check <FILE>:<LINES> .",
+            "aroma check --help",
+        ));
+    }
+    let toplevel = PathBuf::from(String::from_utf8_lossy(&top_out.stdout).trim_end_matches(['\n', '\r']));
+
+    let mut diff_args = vec![
+        "-c", "core.quotePath=false", "diff", "--unified=0", "--no-color", "--no-ext-diff",
+        "--no-textconv", "--ignore-submodules", "--src-prefix=a/", "--dst-prefix=b/",
+    ];
+    if diff.staged {
+        diff_args.push("--cached");
+    }
+    diff_args.push(base);
+    diff_args.push("--");
+    let diff_out = run_git(&toplevel, &diff_args)?;
+    if !diff_out.status.success() {
+        return Err(CliError::user_input(
+            format!("git diff {base} failed: {}", git_stderr_line(&diff_out)),
+            "The --diff base must be a valid git revision (default HEAD, e.g. origin/main)",
+            "aroma check --diff=HEAD .",
+            "aroma check --help",
+        ));
+    }
+    let mut targets = parse_unified_zero_diff(&String::from_utf8_lossy(&diff_out.stdout));
+
+    if !diff.staged && base == "HEAD" {
+        let ls = run_git(&toplevel, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+        if !ls.status.success() {
+            return Err(CliError::tool_env(
+                format!("git ls-files failed: {}", git_stderr_line(&ls)),
+                "Untracked files are listed with `git ls-files --others --exclude-standard`",
+                "aroma check --diff --staged .",
+                "aroma check --help",
+            ));
+        }
+        for raw in ls.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+            let path = String::from_utf8_lossy(raw).into_owned();
+            targets.push(CheckTarget { path: PathBuf::from(path), lines: None });
+        }
+    }
+
+    let cwd = std::env::current_dir().and_then(fs::canonicalize).ok();
+    let top_canon = fs::canonicalize(&toplevel).unwrap_or(toplevel);
+    for t in &mut targets {
+        let abs = top_canon.join(&t.path);
+        t.path = match cwd.as_deref().and_then(|c| abs.strip_prefix(c).ok()) {
+            Some(rel) => rel.to_path_buf(),
+            None => abs,
+        };
+    }
+    Ok(targets)
+}
+
+/// True when sorted `lines` contains any line in `start..=end`.
+fn overlaps_sorted(lines: &[u32], start: u32, end: u32) -> bool {
+    let i = lines.partition_point(|&l| l < start);
+    i < lines.len() && lines[i] <= end
+}
+
+pub(crate) fn run_check(cmd: &CheckCmd) -> Result<CommandOutcome, CliError> {
+    // Classify positionals: with --diff they are an optional leading base revision plus corpus
+    // PATHs; otherwise FILE[:LINES] targets (bare regular files) plus corpus PATHs.
+    let mut base = cmd.diff.as_ref().and_then(|d| d.base.clone());
+    let mut corpus_paths: Vec<PathBuf> = Vec::new();
+    let mut explicit: Vec<CheckTarget> = Vec::new();
+    for (i, arg) in cmd.args.iter().enumerate() {
+        let meta = fs::metadata(&arg.path);
+        if cmd.diff.is_some() {
+            if i == 0 && base.is_none() && meta.is_err() {
+                base = Some(arg.path.to_string_lossy().into_owned());
+            } else {
+                corpus_paths.push(arg.path.clone());
+            }
+        } else if arg.lines.is_some() || meta.is_ok_and(|m| m.is_file()) {
+            explicit.push(CheckTarget { path: arg.path.clone(), lines: arg.lines.clone() });
+        } else {
+            corpus_paths.push(arg.path.clone());
+        }
+    }
+    let in_diff = cmd.diff.is_some();
+    let base_ref = base.as_deref().unwrap_or("HEAD");
+
+    let walk = walk_paths(
+        &corpus_paths,
+        &WalkOptions {
+            max_file_bytes: cmd.max_file_bytes,
+            extra_ignores: cmd.ignores.clone(),
+            lang_filter: cmd.lang.clone(),
+        },
+    )?;
+
+    let targets = match &cmd.diff {
+        Some(d) => {
+            let hint_dir = match corpus_paths.first() {
+                Some(p) if p.is_dir() => p.clone(),
+                Some(p) => p
+                    .parent()
+                    .filter(|d| !d.as_os_str().is_empty())
+                    .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+                None => PathBuf::from("."),
+            };
+            discover_git_changes(d, base_ref, &hint_dir)?
+        }
+        None => explicit,
+    };
+
+    // Resolve targets to corpus files (by display path, then canonical path), merging duplicates.
+    let mut skips = SkipLog::default();
+    let mut resolved: Vec<ResolvedTarget> = Vec::new();
+    let mut by_path: FxHashMap<String, usize> = FxHashMap::default();
+    let mut canon_map: Option<FxHashMap<PathBuf, usize>> = None;
+    for t in targets {
+        let disp = normalize_display_path(&t.path);
+        let mut idx = walk.files.iter().position(|f| f.path == disp);
+        if idx.is_none()
+            && let Ok(tc) = fs::canonicalize(&t.path)
+        {
+            let map = canon_map.get_or_insert_with(|| {
+                walk.fs_paths
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, p)| fs::canonicalize(p).ok().map(|c| (c, i)))
+                    .collect()
+            });
+            idx = map.get(&tc).copied();
+        }
+        let source = if let Some(i) = idx {
+            TargetSource::Indexed(i)
+        } else {
+            let Some(lang) = infer_language_for_path(&disp) else {
+                skips.push("unsupported_changed_files", "skipped (unsupported language)", disp);
+                continue;
+            };
+            if cmd.lang.as_deref().is_some_and(|l| l != lang) {
+                skips.push("lang_filtered_changed_files", "skipped (excluded by --lang)", disp);
+                continue;
+            }
+            if in_diff {
+                skips.push(
+                    "changed_files_outside_corpus",
+                    "skipped (outside the indexed PATHs, ignored, oversized, or non-UTF-8)",
+                    disp,
+                );
+                continue;
+            }
+            let Some(bytes) = read_file_bounded(&t.path, cmd.max_file_bytes)? else {
+                skips.push("oversized_changed_files", "skipped (exceeded --max-file-bytes)", disp);
+                continue;
+            };
+            let Ok(source) = String::from_utf8(bytes) else {
+                skips.push("non_utf8_changed_files", "skipped (not valid UTF-8)", disp);
+                continue;
+            };
+            TargetSource::External(SourceFile { path: disp, source })
+        };
+        let key = match &source {
+            TargetSource::Indexed(i) => walk.files[*i].path.clone(),
+            TargetSource::External(sf) => sf.path.clone(),
+        };
+        if let Some(&ri) = by_path.get(&key) {
+            match (&mut resolved[ri].lines, t.lines) {
+                (Some(acc), Some(more)) => acc.extend(more),
+                (slot, _) => *slot = None,
+            }
+        } else {
+            by_path.insert(key, resolved.len());
+            resolved.push(ResolvedTarget { source, lines: t.lines });
+        }
+    }
+
+    let index = build_index(
+        &walk.files,
+        IndexOptions {
+            threads: cmd.threads,
+            max_file_length: cmd.max_file_bytes,
+            ..Default::default()
+        },
+    );
+    let corpus = corpus_summary(&walk, &index);
+
+    // Sorted, deduplicated changed lines per target (whole-file targets expand here).
+    let changed_lines: Vec<Vec<u32>> = resolved
+        .iter_mut()
+        .map(|r| {
+            let mut lines = match r.lines.take() {
+                Some(l) => l,
+                None => (1..=line_count_for(&r.file(&walk).source)).collect(),
+            };
+            lines.sort_unstable();
+            lines.dedup();
+            lines
+        })
+        .collect();
+    let changed_by_path: FxHashMap<&str, &[u32]> = resolved
+        .iter()
+        .zip(&changed_lines)
+        .map(|(r, l)| (r.file(&walk).path.as_str(), l.as_slice()))
+        .collect();
+
+    let mut queries: Vec<Query> = Vec::new();
+    for (r, lines) in resolved.iter().zip(&changed_lines) {
+        queries.extend(queries_from_lines(&index, r.file(&walk), lines));
+    }
+    let total_changed = queries.len();
+    queries.retain(|q| q.size() >= cmd.min_size);
+    let checked = queries.len();
+    let skipped_small = total_changed - checked;
+
+    // New code must never match other new code: drop every method overlapping a changed line
+    // in any changed file, plus test files unless --include-tests.
+    let exclude_tests = cmd.tests == TestFilter::ExcludeTests;
+    let exclude = |m: &MethodRef| -> bool {
+        (exclude_tests && is_test_path(&m.path))
+            || changed_by_path
+                .get(m.path.as_str())
+                .is_some_and(|lines| overlaps_sorted(lines, m.start_line, m.end_line))
+    };
+    let opts = SearchOptions {
+        search_limit: cmd.search_limit,
+        limit: cmd.top,
+        min_similarity: cmd.min_sim,
+        exclude: Some(&exclude),
+    };
+    let mut findings: Vec<CheckFindingOut> = Vec::new();
+    for q in &queries {
+        let Some(origin) = &q.origin else {
+            continue;
+        };
+        let matches: Vec<CheckMatchOut> = search(&index, q, &opts)
+            .into_iter()
+            .map(|h| CheckMatchOut {
+                method: from_method_ref(&h.method),
+                similarity: round3(h.similarity),
+                matched_lines: h.matched_lines,
+            })
+            .collect();
+        if !matches.is_empty() {
+            findings.push(CheckFindingOut {
+                changed: from_method_ref(origin),
+                changed_lines: q.lines.clone().unwrap_or_default(),
+                query_size: q.size(),
+                matches,
+            });
+        }
+    }
+
+    let path_str = format_path_args(&corpus_paths);
+    let mut commands = Vec::new();
+    if let Some(f) = findings.first() {
+        commands.push(SuggestedCommand {
+            action: "search_changed_function".to_string(),
+            command: format!(
+                "aroma search {path_str} --file {} --lines {}-{} --json",
+                shell_quote(&f.changed.path),
+                f.changed.start_line,
+                f.changed.end_line
+            ),
+            destructive: false,
+        });
+    }
+    let staged = cmd.diff.as_ref().is_some_and(|d| d.staged);
+    let hint = if resolved.is_empty() {
+        Some(if in_diff {
+            format!(
+                "No changed supported source files in `git diff {}{base_ref}`; nothing to check",
+                if staged { "--cached " } else { "" }
+            )
+        } else {
+            "No supported source files to check".to_string()
+        })
+    } else if total_changed == 0 {
+        Some("No indexed function overlaps the changed lines (only top-level or non-code lines changed)".to_string())
+    } else if checked == 0 {
+        Some(format!(
+            "All {skipped_small} changed function(s) are below --min-size {}; lower it to check small functions (tiny queries match unrelated code)",
+            cmd.min_size
+        ))
+    } else if findings.is_empty() {
+        Some(format!(
+            "No existing function reached --min-sim {:.2}; the changed code does not duplicate the indexed corpus",
+            cmd.min_sim
+        ))
+    } else {
+        None
+    };
+
+    let skip_warnings = skips.into_warnings();
+    let mut warnings = walk.warnings.clone();
+    warnings.extend(skip_warnings.iter().cloned());
+
+    let mut stderr_notes = Vec::new();
+    let stdout = match cmd.mode {
+        OutputMode::Json => {
+            #[derive(Serialize)]
+            struct CheckOut<'a> {
+                ok: bool,
+                tool_version: &'static str,
+                contract_version: &'static str,
+                data_hash: &'a str,
+                corpus: &'a CorpusSummary,
+                source: &'static str,
+                base: Option<&'a str>,
+                changed_files: usize,
+                checked: usize,
+                skipped_small: usize,
+                total: usize,
+                findings: &'a [CheckFindingOut],
+                commands: &'a [SuggestedCommand],
+                warnings: &'a [WarningItem],
+                hint: Option<String>,
+            }
+            let out = CheckOut {
+                ok: true,
+                tool_version: env!("CARGO_PKG_VERSION"),
+                contract_version: "1",
+                data_hash: &walk.data_hash,
+                corpus: &corpus,
+                source: if in_diff { "git_diff" } else { "file_lines" },
+                base: in_diff.then_some(base_ref),
+                changed_files: resolved.len(),
+                checked,
+                skipped_small,
+                total: findings.len(),
+                findings: &findings,
+                commands: &commands,
+                warnings: &warnings,
+                hint,
+            };
+            serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
+        }
+        OutputMode::Human => {
+            stderr_notes.extend(skip_warnings.iter().map(|w| format!("warning: {}", w.message)));
+            let mut txt = String::new();
+            for f in &findings {
+                let _ = writeln!(
+                    txt,
+                    "{}:{}-{}  {}  likely duplicates existing code; consider reusing:",
+                    f.changed.path, f.changed.start_line, f.changed.end_line, f.changed.name
+                );
+                for m in &f.matches {
+                    let _ = writeln!(
+                        txt,
+                        "    {:.3}  {}  {}:{}-{}",
+                        m.similarity, m.method.name, m.method.path, m.method.start_line, m.method.end_line
+                    );
+                }
+                txt.push('\n');
+            }
+            if let Some(h) = &hint {
+                let _ = writeln!(txt, "hint: {h}");
+            }
+            let _ = write!(
+                txt,
+                "{checked} changed function{} checked, {} with likely existing equivalents",
+                if checked == 1 { "" } else { "s" },
+                findings.len()
+            );
+            if skipped_small > 0 {
+                let _ = write!(txt, " ({skipped_small} skipped below --min-size {})", cmd.min_size);
+            }
+            txt.push('\n');
+            txt
+        }
+    };
+
+    Ok(CommandOutcome {
+        exit: if cmd.fail_on_findings && !findings.is_empty() { ExitKind::Findings } else { ExitKind::Success },
+        stdout,
+        stderr_notes,
     })
 }
 

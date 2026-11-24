@@ -35,6 +35,8 @@ CORE COMMANDS:
   clones [PATH...]             Detect exact and near-duplicate code clones across a repository or paths
   search [PATH...]             Search for structurally similar methods via --snippet, --snippet-file, or --file/--lines
   recommend [PATH...]          Cluster structural matches into idiomatic code recommendations
+  check (--diff | FILE[:LINES]...) [PATH...]
+                               Lint changed code for existing functions that already do the same thing
   bench                        Run reproducible manifest/query benchmark suite (JSON output)
   help [COMMAND]               Show detailed help for a command
 
@@ -51,6 +53,7 @@ EXIT CODES:
   1  user-input-error          Unknown flag/subcommand, invalid value, or missing required query input
   2  safety-block              Reserved policy block (aroma is read-only)
   3  tool-environment-error    Missing/unreadable path or malformed benchmark JSON file
+  4  findings                  `check` found changed functions with likely existing equivalents (unless --no-fail)
 
 ENV VARS:
   AROMA_ROBOT=1                Default to --json output across read commands
@@ -62,6 +65,7 @@ EXAMPLES:
   aroma clones ./src --lang rust --min-sim 0.80 --json
   aroma search ./src --snippet 'values.iter().sum()' --lang rust --json
   aroma recommend ./src --file src/lib.rs --lines 10-30 --json
+  aroma check --diff .
 ",
             env!("CARGO_PKG_VERSION")
         ),
@@ -152,6 +156,54 @@ OPTIONS:
   --threads <N>, -t <N>        Worker thread count (1..={MAX_THREADS})
 "
         ),
+        HelpTopic::Check => format!(
+            "\
+aroma check — Lint changed code: report EXISTING functions that already do the same thing
+
+USAGE:
+  aroma check --diff [<BASE>] [OPTIONS] [PATH...]
+  aroma check <FILE>[:<LINES>]... [OPTIONS] [PATH...]
+
+Each changed function (a function overlapping a changed line) becomes a structural query against
+ONE index over PATH... (default: .; same walking/ignore rules as `search`). Existing functions with
+similarity >= --min-sim are reported so the change can reuse them instead of duplicating them.
+Functions overlapping changed lines in any changed file are never reported as matches, so new
+code never matches other new code in the same change.
+
+CHANGED CODE (choose one):
+  --diff [<BASE>]              Changed lines from `git diff --unified=0 <BASE>` (default BASE: HEAD, i.e.
+                               uncommitted staged + unstaged edits; untracked files count as fully changed).
+                               BASE may be any revision (e.g. origin/main); also --diff=<BASE>.
+                               A first positional that is not an existing path is taken as BASE.
+  --staged                     With --diff: only staged changes (`git diff --cached <BASE>`)
+  <FILE>[:<LINES>]             Explicit changed lines, e.g. src/a.ts:12 or src/a.ts:10-25,30; a bare FILE
+                               means every line. Files of unsupported languages are skipped with a warning.
+
+OPTIONS:
+  --json, --robot, -j          Emit structured deterministic JSON
+  --top <N>, --limit <N>, -n   Max existing matches per changed function (default: 3, max: {MAX_TOP})
+  --min-sim <0.0..1.0>         Minimum similarity for a finding (default: 0.71, the \"reuse with minimal changes\" threshold)
+  --min-size <N>               Skip changed functions with fewer structural features (default: 30; tiny queries match unrelated code)
+  --search-limit <N>           Phase II pruning candidate pool (default: 1000, max: {MAX_SEARCH_LIMIT})
+  --include-tests              Also report matches inside test files (*.test.*, *.spec.*, __tests__/, tests/, ...)
+  --no-fail                    Exit 0 even when findings are reported
+  --lang <rust|python|ts>      Restrict indexing (and checked files) to one language
+  --ignore <DIR_NAME>          Extra directory name to skip (repeatable)
+  --max-file-bytes <N>         Per-file byte cap (default: {DEFAULT_MAX_FILE_BYTES}, max: {MAX_FILE_BYTES_CAP})
+  --threads <N>, -t <N>        Worker thread count (1..={MAX_THREADS})
+
+EXIT CODES:
+  0  no changed function has a likely existing equivalent (or --no-fail)
+  1  invalid flags/arguments or bad --diff base revision
+  3  unreadable path, or git unavailable / not a git work tree
+  4  findings: at least one changed function matched existing code at --min-sim
+
+EXAMPLES:
+  aroma check --diff .
+  aroma check --diff origin/main src
+  aroma check src/services/account.ts:1007-1028 src --json
+"
+        ),
         HelpTopic::Capabilities => "\
 aroma capabilities — Emit machine-readable CLI contract, languages, commands, limits, and exit codes
 
@@ -170,7 +222,7 @@ USAGE:
 aroma schema — Export JSON Schemas for command stdout envelopes
 
 USAGE:
-  aroma schema [--command <triage|clones|search|recommend|capabilities|bench>] [--json]
+  aroma schema [--command <triage|clones|search|recommend|check|capabilities|bench>] [--json]
 "
         .to_string(),
         HelpTopic::Bench => format!(
@@ -282,6 +334,35 @@ pub(crate) fn capabilities_json() -> Value {
                 "exit_codes": [0, 1, 3],
                 "schema_uri": "aroma schema --command recommend --json"
             },
+            "check": {
+                "description": "Lint changed code (git diff or FILE[:LINES]) for EXISTING functions that already do the same thing; exits 4 on findings",
+                "aliases": [],
+                "mutates": false,
+                "json": true,
+                "robot": "--json",
+                "is_mega_command": false,
+                "args": [
+                    {"name": "targets", "required": false, "variadic": true, "description": "FILE[:LINES] changed-code targets (without --diff); a bare FILE means every line"},
+                    {"name": "base", "required": false, "description": "With --diff: first positional that is not an existing path is the git base revision", "default": "HEAD"},
+                    {"name": "paths", "required": false, "variadic": true, "default": "."}
+                ],
+                "flags": ["--diff", "--staged", "--top", "--min-sim", "--min-size", "--search-limit", "--include-tests", "--no-fail", "--lang", "--json", "--ignore", "--max-file-bytes", "--threads"],
+                "flag_defaults": {
+                    "--diff": {"value": "<BASE>", "default": "HEAD", "description": "Changed lines from `git diff --unified=0 <BASE>`; untracked files count as fully changed when BASE is HEAD"},
+                    "--staged": {"value": null, "default": false, "description": "With --diff: only staged changes (`git diff --cached`)"},
+                    "--top": {"value": "<N>", "default": 3, "max": MAX_TOP, "description": "Max existing matches per changed function"},
+                    "--min-sim": {"value": "<0.0..1.0>", "default": 0.71, "description": "Minimum similarity for a finding (reuse-with-minimal-changes threshold)"},
+                    "--min-size": {"value": "<N>", "default": 30, "description": "Skip changed functions with fewer structural features"},
+                    "--search-limit": {"value": "<N>", "default": 1000, "max": MAX_SEARCH_LIMIT, "description": "Phase II pruning candidate pool"},
+                    "--include-tests": {"value": null, "default": false, "description": "Also report matches inside test files"},
+                    "--no-fail": {"value": null, "default": false, "description": "Exit 0 even when findings are reported"},
+                    "--lang": {"value": "<rust|python|typescript>", "default": null, "description": "Restrict indexing and checked files to one language"},
+                    "--ignore": {"value": "<DIR_NAME>", "default": [], "description": "Extra directory name to skip (repeatable)"},
+                    "--max-file-bytes": {"value": "<N>", "default": DEFAULT_MAX_FILE_BYTES, "max": MAX_FILE_BYTES_CAP, "description": "Per-file byte cap"}
+                },
+                "exit_codes": [0, 1, 3, 4],
+                "schema_uri": "aroma schema --command check --json"
+            },
             "capabilities": {
                 "description": "Machine-readable capability contract, commands, exit codes, and limits",
                 "aliases": ["caps", "info"],
@@ -388,6 +469,7 @@ Commands:
   clones                    Detect exact and near-duplicate functions across files
   search                    Structural search by --snippet, --snippet-file, or --file/--lines
   recommend                 Cluster matches into idiomatic code recommendations
+  check                     Lint changed code for existing equivalents (exit 4 on findings)
   capabilities              Full JSON contract (limits, flags, exit codes, schemas)
   robot-docs guide          Agent automation handbook
   schema                    JSON Schema definitions
@@ -428,15 +510,25 @@ Run the mega-command to get corpus stats, top clone clusters, file hotspots, and
   aroma capabilities --json
   aroma schema --command triage --json
 
-## 3. Stream, Exit-Code, and Determinism Guarantees
+## 3. Reuse Check Before Committing (exit 4 = likely duplicate found)
+Before finishing a change, ask whether the new/edited functions duplicate code that already exists:
+
+  aroma check --diff .                        # uncommitted edits (staged + unstaged + untracked) vs HEAD
+  aroma check --diff origin/main src          # everything on this branch
+  aroma check src/lib.rs:10-40 src --json | jq '.findings[] | {changed: .changed.name, reuse: [.matches[].method.name]}'
+
+Each finding names a changed function and up to --top (default 3) EXISTING functions with similarity >= --min-sim (default 0.71). Consider calling or extending those instead of keeping the new copy. Changed functions below --min-size (default 30 features) are skipped; test files are excluded from matches unless --include-tests; functions touched by the change never match each other. Exit `4` means findings were reported (`--no-fail` forces `0`).
+
+## 4. Stream, Exit-Code, and Determinism Guarantees
 - **Stdout vs. Stderr**: `--json` / `--robot-triage` write pure JSON strictly to stdout. Notes, deprecation/alias hints, env warnings, and errors go strictly to stderr.
-- **Determinism**: `triage`, `clones`, `search`, `recommend`, `capabilities`, and `schema` sort paths/ties deterministically and omit wall-clock timestamps and timings from JSON output (`data_hash` fingerprints the exact indexed inputs).
+- **Determinism**: `triage`, `clones`, `search`, `recommend`, `check`, `capabilities`, and `schema` sort paths/ties deterministically and omit wall-clock timestamps and timings from JSON output (`data_hash` fingerprints the exact indexed inputs).
 - **Empty results**: Valid queries with 0 matches return exit code `0` with an empty list (`[]`) and a non-empty `hint` field.
 - **Exit codes**:
   - `0` (`success`): completed (including 0-match queries)
   - `1` (`user-input-error`): invalid flag/command/range/language or missing required query input
   - `2` (`safety-block`): reserved
-  - `3` (`tool-environment-error`): missing/unreadable path or invalid JSON input
+  - `3` (`tool-environment-error`): missing/unreadable path, invalid JSON input, or git unavailable for `check --diff`
+  - `4` (`findings`): `check` reported changed functions with likely existing equivalents (suppress with `--no-fail`)
 "
     .to_string()
 }
@@ -523,6 +615,67 @@ fn schema_for_one(cmd: SchemaCommand) -> Value {
                 }
             }
         }),
+        SchemaCommand::Check => {
+            let method_ref = json!({
+                "type": "object",
+                "required": ["path", "name", "language", "start_line", "end_line"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "name": {"type": "string"},
+                    "language": {"type": "string"},
+                    "start_line": {"type": "integer"},
+                    "end_line": {"type": "integer"}
+                }
+            });
+            json!({
+                "command": "check",
+                "exit_codes": {"0": "no findings (or --no-fail)", "4": "at least one finding at --min-sim"},
+                "stdout_schema": {
+                    "type": "object",
+                    "required": ["ok", "tool_version", "contract_version", "data_hash", "corpus", "source", "base", "changed_files", "checked", "skipped_small", "total", "findings", "commands", "warnings"],
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "tool_version": {"type": "string"},
+                        "contract_version": {"type": "string"},
+                        "data_hash": {"type": "string"},
+                        "corpus": {"type": "object"},
+                        "source": {"enum": ["git_diff", "file_lines"]},
+                        "base": {"type": ["string", "null"], "description": "git base revision when source is git_diff"},
+                        "changed_files": {"type": "integer", "description": "changed supported files resolved for checking"},
+                        "checked": {"type": "integer", "description": "changed functions searched (size >= --min-size)"},
+                        "skipped_small": {"type": "integer", "description": "changed functions skipped below --min-size"},
+                        "total": {"type": "integer", "description": "number of findings"},
+                        "findings": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["changed", "changed_lines", "query_size", "matches"],
+                                "properties": {
+                                    "changed": method_ref,
+                                    "changed_lines": {"type": "array", "items": {"type": "integer"}},
+                                    "query_size": {"type": "integer"},
+                                    "matches": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "required": ["method", "similarity", "matched_lines"],
+                                            "properties": {
+                                                "method": method_ref,
+                                                "similarity": {"type": "number"},
+                                                "matched_lines": {"type": "array", "items": {"type": "integer"}}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "commands": {"type": "array"},
+                        "warnings": {"type": "array"},
+                        "hint": {"type": ["string", "null"]}
+                    }
+                }
+            })
+        }
         SchemaCommand::Capabilities => json!({
             "command": "capabilities",
             "stdout_schema": {
@@ -551,6 +704,7 @@ pub(crate) fn render_schema(command: Option<SchemaCommand>, _mode: OutputMode) -
                 SchemaCommand::Clones.as_str(): schema_for_one(SchemaCommand::Clones),
                 SchemaCommand::Search.as_str(): schema_for_one(SchemaCommand::Search),
                 SchemaCommand::Recommend.as_str(): schema_for_one(SchemaCommand::Recommend),
+                SchemaCommand::Check.as_str(): schema_for_one(SchemaCommand::Check),
                 SchemaCommand::Capabilities.as_str(): schema_for_one(SchemaCommand::Capabilities),
                 SchemaCommand::Bench.as_str(): schema_for_one(SchemaCommand::Bench),
             }
