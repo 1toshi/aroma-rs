@@ -23,7 +23,7 @@ required-features = ["cli"]
 
 [features]
 default = ["cli"]
-cli = ["dep:serde", "dep:serde_json"]
+cli = ["dep:serde", "dep:serde_json", "dep:ignore"]
 
 [dependencies]
 hashbrown = "0.15.5"
@@ -40,6 +40,7 @@ oxc_parser = "0.160"
 oxc_semantic = "0.160"
 oxc_span = "0.160"
 oxc_syntax = "0.160"
+ignore = { version = "0.4.35", optional = true }
 
 [profile.release]
 opt-level = 3

@@ -48,6 +48,11 @@ GLOBAL FLAGS:
   -h, --help                   Show help
   -V, --version                Show version
 
+FILES:
+  Directories are walked skipping what git ignores (.gitignore files up to the repository root and
+  .git/info/exclude; not the global gitignore), the default_ignores directory names in
+  `capabilities --json`, and any --ignore names. A file passed explicitly is always read.
+
 EXIT CODES:
   0  success                   Query/scan succeeded (including valid queries with 0 results)
   1  user-input-error          Unknown flag/subcommand, invalid value, or missing required query input
@@ -446,6 +451,7 @@ pub(crate) fn capabilities_json() -> Value {
             "max_line_spec_count": MAX_LINE_SPEC_COUNT
         },
         "default_ignores": DEFAULT_IGNORES,
+        "respects_gitignore": true,
         "schemas_uri": "aroma schema --json",
         "robot_docs_uri": "aroma robot-docs guide"
     })

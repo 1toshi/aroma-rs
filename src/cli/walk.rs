@@ -109,10 +109,11 @@ pub(crate) fn is_test_path(path: &str) -> bool {
         || filename.ends_with(".spec.jsx")
 }
 
-fn is_ignored_name(name: &str, ignore_set: &HashSet<&str>) -> bool {
-    ignore_set.contains(name)
-}
-
+/// Collects the supported source files under `dir`. Inside a git work tree, files
+/// git ignores are skipped: `.gitignore` files in `dir`, its subdirectories, and
+/// the parent directories up to the repository root, plus `.git/info/exclude`.
+/// The user's global gitignore is not read, so results do not depend on the machine.
+/// Hidden files are walked like any other; `ignore_set` names are skipped at any depth.
 fn collect_dir(
     dir: &Path,
     ignore_set: &HashSet<&str>,
@@ -121,67 +122,49 @@ fn collect_dir(
     out: &mut Vec<(String, PathBuf)>,
     skipped_unsupported: &mut usize,
 ) -> Result<(), CliError> {
-    let entries = fs::read_dir(dir).map_err(|e| {
-        CliError::tool_env(
-            format!("cannot read directory '{}': {e}", dir.display()),
-            "Directory is missing, lacks read permissions, or was removed during scan",
-            "ls -ld <path> && aroma triage . --json",
-            "aroma capabilities --json",
-        )
-    })?;
-    let mut children: Vec<PathBuf> = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            CliError::tool_env(
-                format!("error iterating directory '{}': {e}", dir.display()),
-                "Filesystem iteration failed while traversing directory entries",
-                "aroma triage . --json",
-                "aroma capabilities --json",
-            )
-        })?;
-        children.push(entry.path());
-    }
-    children.sort();
-
-    for path in children {
-        let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
+    let ignored_names: HashSet<String> = ignore_set.iter().map(|n| (*n).to_string()).collect();
+    let walker = ignore::WalkBuilder::new(dir)
+        .hidden(false)
+        .ignore(false)
+        .git_global(false)
+        .follow_links(false)
+        .filter_entry(move |entry| {
+            entry.depth() == 0 || entry.file_name().to_str().is_none_or(|name| !ignored_names.contains(name))
+        })
+        .build();
+    for entry in walker {
+        let entry = match entry {
+            Ok(entry) => entry,
+            // A malformed ignore file only drops its bad patterns; it is not a reason to stop.
+            Err(e) if e.io_error().is_none() => continue,
+            Err(e) => {
+                return Err(CliError::tool_env(
+                    format!("cannot read directory under '{}': {e}", dir.display()),
+                    "Directory is missing, lacks read permissions, or was removed during scan",
+                    "ls -ld <path> && aroma triage . --json",
+                    "aroma capabilities --json",
+                ));
+            }
         };
-        if is_ignored_name(fname, ignore_set) {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
+        let path = entry.into_path();
+        let disp = normalize_display_path(&path);
+        let lower = disp.to_ascii_lowercase();
+        if IGNORED_SUFFIXES.iter().any(|suf| lower.ends_with(suf)) {
             continue;
         }
-        if meta.is_dir() {
-            collect_dir(
-                &path,
-                ignore_set,
-                supported_exts,
-                opts,
-                out,
-                skipped_unsupported,
-            )?;
-        } else if meta.is_file() {
-            let disp = normalize_display_path(&path);
-            let lower = disp.to_ascii_lowercase();
-            if IGNORED_SUFFIXES.iter().any(|suf| lower.ends_with(suf)) {
-                continue;
-            }
-            if !supported_exts.iter().any(|ext| lower.ends_with(ext)) {
-                *skipped_unsupported += 1;
-                continue;
-            }
-            if let Some(ref wanted) = opts.lang_filter
-                && infer_language_for_path(&lower) != Some(wanted.as_str())
-            {
-                continue;
-            }
-            out.push((disp, path));
+        if !supported_exts.iter().any(|ext| lower.ends_with(ext)) {
+            *skipped_unsupported += 1;
+            continue;
         }
+        if let Some(wanted) = &opts.lang_filter
+            && infer_language_for_path(&lower) != Some(wanted.as_str())
+        {
+            continue;
+        }
+        out.push((disp, path));
     }
     Ok(())
 }

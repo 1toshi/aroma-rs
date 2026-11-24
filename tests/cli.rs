@@ -499,6 +499,29 @@ pub fn average_even_tripled(nums: &[i32]) -> i32 {
 "#;
 
 #[test]
+fn walk_skips_files_git_ignores() {
+    let dir = TempDir::new("gitignore");
+    git(&dir.path, &["init", "-q"]);
+    dir.write(".gitignore", "lib/\n");
+    dir.write("pkg/.gitignore", "*.gen.rs\n");
+    dir.write("pkg/src/real.rs", "pub fn one() -> i32 {\n    1\n}\n");
+    // Build output and generated code that duplicate each other: indexing them would
+    // report clones nobody can act on.
+    dir.write("pkg/lib/out.rs", DUPLICATE_FN);
+    dir.write("pkg/src/twin.gen.rs", DUPLICATE_FN);
+    dir.write(".hidden/kept.rs", "pub fn two() -> i32 {\n    2\n}\n");
+
+    for (cwd, path) in [(dir.path.clone(), "."), (dir.path.join("pkg"), "."), (dir.path.clone(), "pkg")] {
+        let out = run_aroma_in(&cwd, &["clones", path, "--json"]);
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        let v: Value = serde_json::from_slice(&out.stdout).expect("clones json");
+        let expected = if cwd == dir.path && path == "." { 2 } else { 1 };
+        assert_eq!(v["corpus"]["files_indexed"], expected, "cwd={} path={path}: {v}", cwd.display());
+        assert_eq!(v["total_clusters"], 0, "ignored duplicates were clustered: {v}");
+    }
+}
+
+#[test]
 fn check_file_lines_reports_existing_equivalent_and_gates_exit_code() {
     let dir = TempDir::new("check_lines");
     write_multi_lang_fixture(&dir);
