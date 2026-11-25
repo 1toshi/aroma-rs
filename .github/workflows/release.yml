@@ -48,11 +48,11 @@ jobs:
             echo "Tag '$TAG' does not match Cargo.toml version 'v$VERSION'" >&2
             exit 1
           fi
-      - name: Test
       - name: Test the static build
         if: matrix.target == 'x86_64-unknown-linux-musl'
         # Through zigbuild: mimalloc's C build needs a musl C compiler, which plain cargo lacks.
         run: cargo zigbuild test --release --locked --target ${{ matrix.target }}
+      - name: Build
         run: cargo zigbuild --release --locked --target ${{ matrix.target }}
       - name: Check the binary is static
         run: |
