@@ -189,6 +189,9 @@ OPTIONS:
   --top <N>, --limit <N>, -n   Max existing matches per changed function (default: 3, max: {MAX_TOP})
   --min-sim <0.0..1.0>         Minimum similarity for a finding (default: 0.71, the \"reuse with minimal changes\" threshold)
   --min-size <N>               Skip changed functions with fewer structural features (default: 30; tiny queries match unrelated code)
+  --min-coverage <0.0..1.0>    Minimum share of the EXISTING function the changed code accounts for (default: 0.25).
+                               --min-sim measures how much of the changed code appears in the existing function;
+                               this drops matches where that overlap is a small part of a much larger function.
   --search-limit <N>           Phase II pruning candidate pool (default: 1000, max: {MAX_SEARCH_LIMIT})
   --include-tests              Also report matches inside test files (*.test.*, *.spec.*, __tests__/, tests/, ...)
   --no-fail                    Exit 0 even when findings are reported
@@ -351,13 +354,14 @@ pub(crate) fn capabilities_json() -> Value {
                     {"name": "base", "required": false, "description": "With --diff: first positional that is not an existing path is the git base revision", "default": "HEAD"},
                     {"name": "paths", "required": false, "variadic": true, "default": "."}
                 ],
-                "flags": ["--diff", "--staged", "--top", "--min-sim", "--min-size", "--search-limit", "--include-tests", "--no-fail", "--lang", "--json", "--ignore", "--max-file-bytes", "--threads"],
+                "flags": ["--diff", "--staged", "--top", "--min-sim", "--min-size", "--min-coverage", "--search-limit", "--include-tests", "--no-fail", "--lang", "--json", "--ignore", "--max-file-bytes", "--threads"],
                 "flag_defaults": {
                     "--diff": {"value": "<BASE>", "default": "HEAD", "description": "Changed lines from `git diff --unified=0 <BASE>`; untracked files count as fully changed when BASE is HEAD"},
                     "--staged": {"value": null, "default": false, "description": "With --diff: only staged changes (`git diff --cached`)"},
                     "--top": {"value": "<N>", "default": 3, "max": MAX_TOP, "description": "Max existing matches per changed function"},
                     "--min-sim": {"value": "<0.0..1.0>", "default": 0.71, "description": "Minimum similarity for a finding (reuse-with-minimal-changes threshold)"},
                     "--min-size": {"value": "<N>", "default": 30, "description": "Skip changed functions with fewer structural features"},
+                    "--min-coverage": {"value": "<0.0..1.0>", "default": 0.25, "description": "Minimum share of the existing function's features the changed code accounts for"},
                     "--search-limit": {"value": "<N>", "default": 1000, "max": MAX_SEARCH_LIMIT, "description": "Phase II pruning candidate pool"},
                     "--include-tests": {"value": null, "default": false, "description": "Also report matches inside test files"},
                     "--no-fail": {"value": null, "default": false, "description": "Exit 0 even when findings are reported"},
@@ -523,7 +527,7 @@ Before finishing a change, ask whether the new/edited functions duplicate code t
   aroma check --diff origin/main src          # everything on this branch
   aroma check src/lib.rs:10-40 src --json | jq '.findings[] | {changed: .changed.name, reuse: [.matches[].method.name]}'
 
-Each finding names a changed function and up to --top (default 3) EXISTING functions with similarity >= --min-sim (default 0.71). Consider calling or extending those instead of keeping the new copy. Changed functions below --min-size (default 30 features) are skipped; test files are excluded from matches unless --include-tests; functions touched by the change never match each other. Exit `4` means findings were reported (`--no-fail` forces `0`).
+Each finding names a changed function and up to --top (default 3) EXISTING functions with similarity >= --min-sim (default 0.71) and coverage >= --min-coverage (default 0.25). Similarity is the share of the changed code found in the existing function; coverage is the share of the existing function the changed code accounts for, so a short helper whose pieces are scattered through a much larger function is not reported. Consider calling or extending those instead of keeping the new copy. Changed functions below --min-size (default 30 features) are skipped; test files are excluded from matches unless --include-tests; functions touched by the change never match each other. Exit `4` means findings were reported (`--no-fail` forces `0`).
 
 ## 4. Stream, Exit-Code, and Determinism Guarantees
 - **Stdout vs. Stderr**: `--json` / `--robot-triage` write pure JSON strictly to stdout. Notes, deprecation/alias hints, env warnings, and errors go strictly to stderr.
@@ -633,6 +637,17 @@ fn schema_for_one(cmd: SchemaCommand) -> Value {
                     "end_line": {"type": "integer"}
                 }
             });
+            // Built separately: nesting it inline exceeds `json!`'s macro recursion limit.
+            let match_item = json!({
+                "type": "object",
+                "required": ["method", "similarity", "coverage", "matched_lines"],
+                "properties": {
+                    "method": method_ref,
+                    "similarity": {"type": "number", "description": "share of the changed code's features found in this function"},
+                    "coverage": {"type": "number", "description": "share of this function's features the changed code accounts for"},
+                    "matched_lines": {"type": "array", "items": {"type": "integer"}}
+                }
+            });
             json!({
                 "command": "check",
                 "exit_codes": {"0": "no findings (or --no-fail)", "4": "at least one finding at --min-sim"},
@@ -660,18 +675,7 @@ fn schema_for_one(cmd: SchemaCommand) -> Value {
                                     "changed": method_ref,
                                     "changed_lines": {"type": "array", "items": {"type": "integer"}},
                                     "query_size": {"type": "integer"},
-                                    "matches": {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "object",
-                                            "required": ["method", "similarity", "matched_lines"],
-                                            "properties": {
-                                                "method": method_ref,
-                                                "similarity": {"type": "number"},
-                                                "matched_lines": {"type": "array", "items": {"type": "integer"}}
-                                            }
-                                        }
-                                    }
+                                    "matches": {"type": "array", "items": match_item}
                                 }
                             }
                         },

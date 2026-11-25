@@ -272,6 +272,7 @@ fn prop_similarity_monotonicity_bounds_and_ordering() {
                         limit: 1000,
                         search_limit: 2000,
                         min_similarity: thr,
+                        min_coverage: 0.0,
                         exclude: None,
                     },
                 );

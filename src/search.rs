@@ -28,7 +28,11 @@ const PAR_PRUNE_REC_TOK_THRESHOLD: usize = 1_000_000;
 pub struct SearchOptions<'a> {
     pub search_limit: usize,
     pub limit: usize,
+    /// Results need `similarity > min_similarity`.
     pub min_similarity: f64,
+    /// Results need `coverage >= min_coverage`. Applied before `limit`, so a method the
+    /// floor removes leaves room for the next-best one instead of shrinking the result list.
+    pub min_coverage: f64,
     pub exclude: Option<&'a (dyn Fn(&MethodRef) -> bool + Sync)>,
 }
 
@@ -38,6 +42,7 @@ impl Default for SearchOptions<'_> {
             search_limit: DEFAULT_SEARCH_LIMIT,
             limit: DEFAULT_RESULT_LIMIT,
             min_similarity: 0.0,
+            min_coverage: 0.0,
             exclude: None,
         }
     }
@@ -46,7 +51,12 @@ impl Default for SearchOptions<'_> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
     pub method: MethodRef,
+    /// Share of the query's features found in the method (the paper's overlap score), 0 to 1.
     pub similarity: f64,
+    /// Share of the method's features the query accounts for, 0 to 1: the same overlap divided
+    /// by the method's size instead of the query's. Low when a small query matches a small part
+    /// of a much larger method.
+    pub coverage: f64,
     pub matched_lines: Vec<u32>,
 }
 
@@ -502,6 +512,13 @@ fn matched_lines_of(lidx: &LanguageIndex, loc: &MethodLocation, tokens: &[usize]
     }
 }
 
+/// `score` counts each shared feature up to the smaller of its two counts, so dividing by
+/// the method's feature count (with repeats) mirrors `similarity` dividing by the query's.
+fn coverage_of(lidx: &LanguageIndex, cand: &ScoredCandidate<'_>) -> f64 {
+    let size = lidx.method_features(cand.mid as usize).len();
+    if size == 0 { 0.0 } else { (cand.score as f64 / size as f64).min(1.0) }
+}
+
 pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) -> Vec<SearchResult> {
     if options.limit == 0 || options.search_limit == 0 || query.size == 0 || query.features.is_empty() {
         return Vec::new();
@@ -512,28 +529,35 @@ pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) ->
     let qsize = query.size as f64;
 
     with_search_scratch(|sc| {
-        let scored = rank_scored(
+        // With a coverage floor, rank the whole Phase I pool: the floor can reject any of the
+        // top `limit` by similarity, and the methods behind them must be able to take their place.
+        let filter_coverage = options.min_coverage > 0.0;
+        let mut scored = rank_scored(
             index,
             lidx,
             query,
             options.search_limit,
-            options.limit,
+            if filter_coverage { options.search_limit } else { options.limit },
             options.exclude,
             sc,
         );
 
-        // Slice strictly to the surviving hits (`similarity > min_similarity`, `<= limit`)
-        let mut survive_end = 0usize;
+        // Keep strictly the surviving hits (`similarity > min_similarity`,
+        // `coverage >= min_coverage`, at most `limit`), in rank order.
+        let mut kept = 0usize;
         let mut total_toks = 0usize;
-        let cap = scored.len().min(options.limit);
-        while survive_end < cap {
-            if (scored[survive_end].score as f64 / qsize) <= options.min_similarity {
-                break;
+        scored.retain(|cand| {
+            if kept >= options.limit
+                || (cand.score as f64 / qsize) <= options.min_similarity
+                || (filter_coverage && coverage_of(lidx, cand) < options.min_coverage)
+            {
+                return false;
             }
-            total_toks += lidx.methods[scored[survive_end].mid as usize].primary.tok_count as usize;
-            survive_end += 1;
-        }
-        let survivors = &scored[..survive_end];
+            kept += 1;
+            total_toks += lidx.methods[cand.mid as usize].primary.tok_count as usize;
+            true
+        });
+        let survivors = &scored[..];
         if survivors.is_empty() {
             return Vec::new();
         }
@@ -577,6 +601,7 @@ pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) ->
                             SearchResult {
                                 method: index.make_ref(lidx, cand.loc),
                                 similarity: cand.score as f64 / qsize,
+                                coverage: coverage_of(lidx, cand),
                                 matched_lines,
                             }
                         })
@@ -603,6 +628,7 @@ pub fn search(index: &AromaIndex, query: &Query, options: &SearchOptions<'_>) ->
                 out.push(SearchResult {
                     method: index.make_ref(lidx, cand.loc),
                     similarity: cand.score as f64 / qsize,
+                    coverage: coverage_of(lidx, cand),
                     matched_lines,
                 });
             }

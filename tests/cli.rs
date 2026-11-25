@@ -1,5 +1,6 @@
 #![cfg(feature = "cli")]
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -582,6 +583,54 @@ fn check_file_lines_reports_existing_equivalent_and_gates_exit_code() {
     assert!(sv["findings"].as_array().expect("findings").is_empty());
     let big_min = run_aroma(&["check", &a_lines, root, "--min-size", "100000"], &[], None);
     assert_eq!(big_min.status.code(), Some(0));
+}
+
+/// The body of `DUPLICATE_FN`, inlined in the middle of a function about four times its size.
+fn big_function_containing_duplicate() -> String {
+    let mut body = String::from("pub fn run_report(rows: &[Row], nums: &[i32]) -> Report {\n");
+    for i in 0..12 {
+        let _ = write!(
+            body,
+            "    let label_{i} = rows.iter().filter(|r| r.kind == Kind::K{i}).map(|r| r.name.clone()).collect::<Vec<_>>();\n    emit(&label_{i}, format!(\"section {{}}\", {i}));\n"
+        );
+    }
+    body.push_str("    let mut sum = 0;\n    let mut n = 0;\n    for &x in nums {\n        if x > 0 && x % 2 == 0 {\n            sum += x * 3;\n            n += 1;\n        }\n    }\n    let avg = if n > 0 { sum / n } else { sum.max(0) };\n");
+    body.push_str("    Report { avg, done: true }\n}\n");
+    body
+}
+
+#[test]
+fn check_coverage_floor_drops_matches_inside_much_larger_functions() {
+    let dir = TempDir::new("check_coverage");
+    let new = dir.write("src/new.rs", DUPLICATE_FN);
+    dir.write("src/big.rs", &big_function_containing_duplicate());
+    let root = dir.path.to_str().expect("utf8");
+    let new_arg = new.to_str().expect("utf8");
+
+    // Without a floor the paper's one-way score matches the large function: every feature of
+    // the new code occurs somewhere in it.
+    let loose = run_aroma(&["check", new_arg, root, "--json", "--min-coverage", "0"], &[], None);
+    assert_eq!(loose.status.code(), Some(4), "stderr: {}", String::from_utf8_lossy(&loose.stderr));
+    let lv: Value = serde_json::from_slice(&loose.stdout).expect("check json");
+    let m = &lv["findings"][0]["matches"][0];
+    assert_eq!(m["method"]["name"], "run_report");
+    let coverage = m["coverage"].as_f64().expect("coverage");
+    assert!(coverage < 0.25, "the new code is a small part of run_report: coverage {coverage}");
+
+    // The default floor drops it: there is nothing in run_report to reuse.
+    let default = run_aroma(&["check", new_arg, root, "--json"], &[], None);
+    assert_eq!(default.status.code(), Some(0), "{}", String::from_utf8_lossy(&default.stdout));
+
+    // A same-size copy still matches under the default floor, and the dropped large function
+    // does not take one of the --top slots.
+    dir.write("src/copy.rs", &DUPLICATE_FN.replace("average_even_tripled", "mean_of_tripled_evens"));
+    let with_copy = run_aroma(&["check", new_arg, root, "--json", "--top", "1"], &[], None);
+    assert_eq!(with_copy.status.code(), Some(4));
+    let cv: Value = serde_json::from_slice(&with_copy.stdout).expect("check json");
+    let matches = cv["findings"][0]["matches"].as_array().expect("matches");
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["method"]["name"], "mean_of_tripled_evens");
+    assert!(matches[0]["coverage"].as_f64().expect("coverage") > 0.9);
 }
 
 #[test]

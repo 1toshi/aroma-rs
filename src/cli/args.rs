@@ -183,6 +183,11 @@ pub(crate) struct CheckArg {
     pub(crate) lines: Option<Vec<u32>>,
 }
 
+/// `check`'s default `--min-coverage`. Deliberately low: it only drops a match whose method is
+/// several times larger than the changed function, where the shared features are scattered
+/// through unrelated code and there is nothing to reuse.
+pub(crate) const DEFAULT_CHECK_MIN_COVERAGE: f64 = 0.25;
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CheckCmd {
     pub(crate) diff: Option<DiffSpec>,
@@ -193,6 +198,7 @@ pub(crate) struct CheckCmd {
     pub(crate) search_limit: usize,
     pub(crate) min_sim: f64,
     pub(crate) min_size: usize,
+    pub(crate) min_coverage: f64,
     pub(crate) tests: TestFilter,
     pub(crate) fail_on_findings: bool,
     pub(crate) lang: Option<String>,
@@ -613,6 +619,7 @@ struct CommonOpts {
     diff_base: Option<String>,
     staged: bool,
     min_size: Option<usize>,
+    min_coverage: Option<f64>,
     no_fail: bool,
     positionals: Vec<String>,
 }
@@ -861,6 +868,14 @@ fn parse_common_flag(
             opts.min_size = Some(parse_int_bounded("--min-size", &v, 0usize, 100_000, subcmd)?);
             Ok(None)
         }
+        "--min-coverage" => {
+            if !allowed.contains(&"--min-coverage") {
+                return Err(unknown_flag_error(flag, allowed, subcmd));
+            }
+            let v = ts.take_val(inline, "--min-coverage", subcmd)?;
+            opts.min_coverage = Some(parse_unit_f64("--min-coverage", &v, subcmd)?);
+            Ok(None)
+        }
         "--no-fail" => {
             if !allowed.contains(&"--no-fail") {
                 return Err(unknown_flag_error(flag, allowed, subcmd));
@@ -898,7 +913,7 @@ fn allowed_flags_for(subcmd: Subcmd) -> &'static [&'static str] {
         ],
         Subcmd::Check => &[
             "--json", "--robot", "--format", "--no-color", "--threads", "--top", "--limit",
-            "--search-limit", "--min-sim", "--min-size", "--diff", "--staged", "--no-fail",
+            "--search-limit", "--min-sim", "--min-size", "--min-coverage", "--diff", "--staged", "--no-fail",
             "--include-tests", "--lang", "--language", "--ignore", "--max-file-bytes", "--help",
             "--version",
         ],
@@ -1221,6 +1236,7 @@ pub(crate) fn parse_args(
                 search_limit: opts.search_limit.unwrap_or(1000),
                 min_sim: opts.min_sim.unwrap_or(0.71),
                 min_size: opts.min_size.unwrap_or(30),
+                min_coverage: opts.min_coverage.unwrap_or(DEFAULT_CHECK_MIN_COVERAGE),
                 tests: opts.tests.unwrap_or(TestFilter::ExcludeTests),
                 fail_on_findings: !opts.no_fail,
                 lang: opts.lang,

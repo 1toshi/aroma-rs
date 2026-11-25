@@ -1463,6 +1463,7 @@ pub(crate) fn run_search(cmd: &SearchCmd) -> Result<CommandOutcome, CliError> {
             limit: cmd.top,
             min_similarity: cmd.min_sim,
             exclude: Some(&exclude_origin),
+            ..Default::default()
         };
         for h in search(&ctx.index, q, &opts) {
             hits_out.push(HitOut {
@@ -1701,6 +1702,7 @@ impl ResolvedTarget {
 struct CheckMatchOut {
     method: MethodRefOut,
     similarity: f64,
+    coverage: f64,
     matched_lines: Vec<u32>,
 }
 
@@ -2080,6 +2082,7 @@ pub(crate) fn run_check(cmd: &CheckCmd) -> Result<CommandOutcome, CliError> {
         search_limit: cmd.search_limit,
         limit: cmd.top,
         min_similarity: cmd.min_sim,
+        min_coverage: cmd.min_coverage,
         exclude: Some(&exclude),
     };
     let mut findings: Vec<CheckFindingOut> = Vec::new();
@@ -2092,6 +2095,7 @@ pub(crate) fn run_check(cmd: &CheckCmd) -> Result<CommandOutcome, CliError> {
             .map(|h| CheckMatchOut {
                 method: from_method_ref(&h.method),
                 similarity: round3(h.similarity),
+                coverage: round3(h.coverage),
                 matched_lines: h.matched_lines,
             })
             .collect();

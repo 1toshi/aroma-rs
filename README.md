@@ -89,6 +89,9 @@ aroma recommend ./src --file src/lib.rs --lines 10-35 --json
 aroma check --diff .                         # uncommitted edits + untracked files vs HEAD
 aroma check --diff origin/main src           # everything on this branch
 aroma check src/lib.rs:10-35 src --json      # explicit FILE[:LINES]; a bare FILE means every line
+# A match needs --min-sim 0.71 (share of the changed code found in the existing function) and
+# --min-coverage 0.25 (share of the existing function the changed code accounts for), so a short
+# helper is not reported against a large function that merely contains similar expressions.
 
 # Run reproducible corpus manifest / query benchmark suite
 aroma bench --manifest /path/to/corpus_manifest.json --queries /path/to/queries.json --threads 15
