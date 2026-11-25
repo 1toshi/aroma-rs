@@ -67,3 +67,6 @@ rc_mutex = "warn"
 try_err = "warn"
 unnecessary_self_imports = "warn"
 verbose_file_reads = "warn"
+
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
